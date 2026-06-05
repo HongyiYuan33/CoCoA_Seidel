@@ -1,0 +1,1287 @@
+#!/usr/bin/env python3
+"""Build a Chinese, beginner-friendly teaching + mentor-report notebook.
+
+The notebook walks through, in report order:
+  model 改成 CoCoA-like  ->  forward model  ->  训练(joint/frozen)  ->
+  evaluator 怎么设定  ->  baseline 结果  ->  全部实验族  ->  汇报话术
+
+Design rules:
+* 讲解为主 + 秒级小演示（CPU 现场跑：建模/前向/loss/evaluator）。
+* 重训练结果一律加载已有产物（summary.json / sweep CSV / 已生成的 PNG），不现场实跑训练。
+* 所有数据路径都做存在性检查，缺文件优雅跳过，notebook 仍能从头跑到尾。
+* matplotlib 标题用英文/ASCII（避免 CJK 字体缺失变成方块）；中文都放在 Markdown 里。
+
+Run on the project remote environment when regenerating:
+  python notebooks/51_mentor_report_cn/build_mentor_report_cn.py
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+NOTEBOOK_PATH = Path(__file__).resolve().parent / "mentor_report_cn.ipynb"
+
+
+def md(source: str) -> dict:
+    return {"cell_type": "markdown", "metadata": {}, "source": source.strip() + "\n"}
+
+
+def code(source: str) -> dict:
+    return {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": source.strip() + "\n",
+    }
+
+
+cells: list[dict] = []
+
+# ──────────────────────────────────────────────────────────────────────────
+# 0. 封面 / TL;DR / 主线图
+# ──────────────────────────────────────────────────────────────────────────
+cells.append(md(r"""
+# CoCoA-like 2D Seidel 实验：从改 model 到出结果（汇报 + 教学版）
+
+> 这本 notebook 同时是两样东西：(1) **教学手册**——一步步带你理解整条 pipeline；(2) **汇报脚本**——
+> 章节顺序就是你跟 mentor 讲述的逻辑顺序。每个技术点都配一个**几秒就能跑完的小演示**或一张**真实结果图**。
+> 重的训练**不在这里现场跑**，而是直接加载已经跑好的结果（`summary.json` / sweep 的 CSV / 已生成的 PNG）。
+
+## 一句话项目定位
+
+我们做的是**盲恢复 (blind recovery)**：显微图像被光学系统的**像差 (aberration)** 模糊了，
+我们手上只有一张模糊的**测量图 (measurement)**，要**同时**反推出两样东西——
+
+1. 清晰的物体图像 **object**；
+2. 描述模糊的 **6 个 Seidel 像差系数**。
+
+做法是：把 **CoCoA**（一种用神经网络表示 object 的方法）的 object/loss 机制，套到一个
+**2D + Seidel ring forward model**（把清晰图变模糊的物理模型）上，让两者一起被优化出来。
+
+## 汇报主线（也是本 notebook 的章节顺序）
+
+```
+①背景问题            ②我把 model 改成 CoCoA-like        ③forward model
+什么是盲恢复     -->  object=坐标MLP + softplus       -->  Seidel系数 -> PSF
+6个Seidel系数         + RSD对比先验 + 5x pretrain            -> ring卷积 -> 模糊图
+      |                                                          |
+      v                                                          v
+④训练: joint vs frozen   -->   ⑤evaluator 怎么设定   -->   ⑥baseline 结果
+object与Seidel一起优化        系数层面 + operator层面          frozen vs joint
+                              probe + twin/mirror 三档         真实数字对比
+      |
+      v
+⑦我设计了哪些实验（全部实验族）   -->   ⑧总结 & 怎么跟 mentor 讲
+accuracy / object-prior / operator-eval        一页 takeaways + 话术 + 下一步
+/ symmetry-ablation / blind-recovery
+/ regression-smoke / real-measurement
+```
+
+## 你在 meeting 里要抓住的三条线
+
+1. **我改了什么**：不是改物理 forward，而是把 object/loss 换成 CoCoA-like。
+2. **我怎么判断好坏**：不只看 Seidel 系数 L2，而是用 operator-probe evaluator 看物理算子是否等价。
+3. **结果说明什么**：CoCoA-like 能明显解模糊，但 blind joint 仍有 Seidel/object 歧义；当前 4D 约定最稳。
+
+下面第 0 步先做**环境自检**，确认本机能 import 这个项目的代码包。
+"""))
+
+cells.append(code(r"""
+# === 第 0 步：环境自检 + 通用工具函数 ===
+import sys, json, math
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import matplotlib.pyplot as plt
+from matplotlib import image as mpimg
+from IPython.display import display, Markdown
+
+# 1) 找到项目根目录（优先绝对路径，其次从 notebook 当前目录往上找）
+ROOT_CANDIDATES = [
+    Path("/Users/hongyimac/Desktop/CoCoA_like_2D_Seidel_Experiment"),
+    Path.cwd(),
+    *Path.cwd().parents,
+]
+PROJECT_ROOT = next((p for p in ROOT_CANDIDATES if (p / "hybrid_ring_cocoa").is_dir()), None)
+assert PROJECT_ROOT is not None, "找不到 hybrid_ring_cocoa，请在项目目录内运行。"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+OUT = PROJECT_ROOT / "outputs" / "cocoa_like_2d_mechanism"   # 大部分结果都在这里
+DEVICE = torch.device("cpu")                                  # 教学演示一律用 CPU
+torch.manual_seed(0); np.random.seed(0)
+
+REQUIRED_ARTIFACTS = {
+    "baseline summary": OUT / "cocoa_like2d_fluor256_ucla_pre400_joint1000_seed0" / "summary.json",
+    "baseline figure": OUT / "cocoa_like2d_fluor256_ucla_pre400_joint1000_seed0" / "summary_comparison.png",
+    "operator sweep summary": OUT / "seidel_operator_eval_summary" / "sweep_summary.csv",
+    "object-prior evaluator": OUT / "object_prior_param_sweep_size512_focused_seidelmetric" / "stage1_seidel_physical_operator_eval_dim512" / "seidel_physical_operator_metrics.csv",
+    "object-prior stats png": OUT / "object_prior_param_sweep_size512_focused_seidelmetric" / "heatmap_param_effects.png",
+    "operator stats png": OUT / "operator_error_calibrated_size256_viz" / "01_distribution_by_dimension.png",
+    "Seidel stage1 sweep": OUT / "seidel_recovery_sweep_stage1_size256_fullbudget_gpu1" / "stage1_metrics.csv",
+}
+
+# 2) 打印版本，确认环境 OK
+import hybrid_ring_cocoa  # noqa: F401
+print("project root :", PROJECT_ROOT)
+print("python       :", sys.version.split()[0])
+print("torch        :", torch.__version__)
+print("hybrid_ring_cocoa import OK")
+
+print("\n关键结果文件自检:")
+for name, path in REQUIRED_ARTIFACTS.items():
+    print(f"  {name:24s} {'OK' if path.is_file() else 'MISSING'}  {path}")
+
+# 3) 通用工具：安全读 CSV / 安全显示 PNG（缺文件就跳过，不报错）
+def read_csv(path):
+    path = Path(path)
+    if not path.is_file():
+        print("（缺 CSV，跳过）", path)
+        return None
+    return pd.read_csv(path)
+
+def show_pngs(paths, titles=None, ncols=2, per=(6.4, 5.0), suptitle=None):
+    paths = [Path(p) for p in paths]
+    items = []
+    for i, p in enumerate(paths):
+        if p.is_file():
+            items.append((p, (titles[i] if titles else p.name)))
+        else:
+            print("（缺图，跳过）", p)
+    if not items:
+        return
+    ncols = min(ncols, len(items)); nrows = math.ceil(len(items) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(per[0]*ncols, per[1]*nrows), squeeze=False)
+    for ax in axes.flat:
+        ax.axis("off")
+    for ax, (p, t) in zip(axes.flat, items):
+        ax.imshow(mpimg.imread(p)); ax.set_title(t, fontsize=9); ax.axis("off")
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=12)
+    plt.tight_layout(); plt.show()
+
+print("工具函数就绪：read_csv() / show_pngs()")
+"""))
+
+# ──────────────────────────────────────────────────────────────────────────
+# 1. 背景
+# ──────────────────────────────────────────────────────────────────────────
+cells.append(md(r"""
+# ① 背景：我们到底在解什么问题
+
+**本章读法**
+
+- **动机**：先把 mentor 拉到同一个问题定义上：我们做的是 blind recovery。
+- **做法**：用 6 个 Seidel 系数描述光学像差，用 ring forward 把清晰 object 变成 measurement。
+- **怎么读**：后面所有指标都围绕"object 是否清楚"和"Seidel/forward operator 是否恢复正确"展开。
+- **一句话结论**：这是一个同时估计 object 和光学模糊参数的欠定问题，所以歧义是核心难点。
+
+## 1.1 一张图说清楚
+
+显微镜（或任何光学系统）都不是完美的，它会给图像引入**像差 (aberration)**，让本来清晰的物体变模糊：
+
+```
+清晰物体 object  ──(光学系统的像差，把每个点摊成一个小光斑 PSF)──>  模糊测量图 measurement
+```
+
+那个"把一个点摊开成的小光斑"叫 **PSF (point spread function，点扩散函数)**。
+像差越大，PSF 越大越歪，图像越糊。
+
+**我们的难处**：实验里我们**只拿得到模糊的 measurement**。既不知道清晰 object，也不知道像差有多大。
+要从一张模糊图里**同时**猜出 object 和像差——这就是**盲恢复 (blind recovery)**。
+"盲"就是指"forward model 的参数（像差）也是未知、要一起解的"。
+
+## 1.2 像差用 6 个 Seidel 系数描述
+
+经典光学里，像差可以用 6 个 **Seidel 系数**来参数化（后端顺序固定）：
+
+| 下标 | 符号 | 名称（中文） | 直觉 |
+|---|---|---|---|
+| 0 | W040 | spherical 球差 | 离轴/离焦方向的整体糊 |
+| 1 | W131 | coma 彗差 | 点变成"彗星拖尾" |
+| 2 | W222 | astigmatism 像散 | 水平/竖直方向糊得不一样 |
+| 3 | W220 | field curvature 场曲 | 像面不是平的，边缘失焦 |
+| 4 | W311 | distortion 畸变 | 几何变形（拉伸/枕形） |
+| 5 | Wd | defocus 离焦 | 整体没对上焦 |
+
+所以"恢复像差"= 恢复这个 **6 维向量** `[W040, W131, W222, W220, W311, Wd]`。
+
+## 1.3 "2D" 和 "ring" 各指什么
+
+- **2D**：我们的 object 是**单张 2D 图**（不是 3D 的 z-stack）。原始 CoCoA 处理的是 3D 体数据，我们把它简化成 2D。
+- **ring（环）**：真实像差是**空间变化**的——图像中心和边缘糊得不一样。这里用 **rdmpy** 的
+  *ring convolution*：把图按到光轴的**半径**切成一圈圈同心环，每个环用自己的 PSF 做卷积。
+  这样就能高效地表达"中心清楚、边缘糊"的空间变化模糊。
+
+记住这条**前向链 (forward model)**，后面会反复用到：
+
+```
+object ──> Seidel 6系数 ──> 每个环的 PSF ──> ring convolution ──> measurement
+```
+"""))
+
+# ──────────────────────────────────────────────────────────────────────────
+# 2. 把 model 改成 CoCoA-like
+# ──────────────────────────────────────────────────────────────────────────
+cells.append(md(r"""
+# ② 我把 model 改成 CoCoA-like（核心章）
+
+**本章读法**
+
+- **动机**：普通像素网格 object 太容易变成模糊解，需要更像 CoCoA 的 object prior。
+- **做法**：保留 2D Seidel ring forward，只替换 object/loss 机制。
+- **怎么读**：重点记住四个改动：坐标 MLP、Softplus + `max_val`、RSD、5x measurement pretrain。
+- **一句话结论**：这是"CoCoA-like object/loss + 原 Seidel physical forward"的混合模型。
+
+## 2.0 先说"原始 CoCoA"是什么
+
+CoCoA 的核心思想：**不用一个像素网格去存 object，而是用一个小神经网络（坐标 MLP / NeRF 风格）去表示
+object**。你给它一个坐标 `(x, y)`，它吐出那个位置的亮度。优化时优化的是这个网络的权重。
+这样做的好处是网络自带平滑先验，更容易在"模糊 + 噪声"里恢复出合理的清晰图。
+
+原始 CoCoA 处理 **3D z-stack + Zernike 像差**。我在这个项目里把它改成 **2D + Seidel ring forward**，
+并保留 CoCoA 在 object/loss 上的几个关键机制。下面是改动总览：
+
+## 2.1 改动对照表
+
+| 维度 | 原始 CoCoA | 本项目（CoCoA-like 2D Seidel） |
+|---|---|---|
+| object 维度 | 3D z-stack `(Z, H, W)` | **2D 单张图 `(H, W)`** |
+| object 表示 | 坐标 MLP (NeRF) | **坐标 MLP（保留）** `CocoaLikeObject2D` |
+| 像差参数 | Zernike 系数 | **6 个 Seidel 系数** |
+| 模糊算子 | 3D 卷积 | **ring convolution（同心环，空间变化）** |
+| 正值输出 | Softplus | **Softplus（保留），`max_val=40` 封顶** |
+| 对比先验 | RSD（reciprocal std/mean） | **RSD（保留）** |
+| 预训练 | 对测量图预训练 | **5× measurement 预训练（保留）** |
+| 空间 TV | 视情况 | **默认不加 xy-TV** |
+
+一句话：**保留 "2D 输入输出 + Seidel ring forward"，把 object/loss 换成 CoCoA 的那套机制。**
+
+> 真实代码在 `scripts/run_cocoa_like_2d_mechanism.py`：
+> `CocoaLikeObject2D`(≈280)、`reciprocal_std_contrast_loss`(≈337)、`pretrain_cocoa_like`(≈345)、
+> `train_cocoa_like`(≈374)。下面我们把这几块**内联复刻**出来现场跑（与脚本实现一致）。
+"""))
+
+cells.append(md(r"""
+## 2.2 改动一：object = 坐标 MLP（`CocoaLikeObject2D`）
+
+它做的事：坐标 `(x,y)` → **radial Fourier 编码**（把坐标升维成很多正弦/余弦特征，让 MLP 能表达高频细节）
+→ 6 层 MLP → 一个标量亮度。把所有像素坐标喂进去，就 render 出一整张图。
+
+下面建一个**随机初始化**的 object，render 一张小图看看（此时还没训练，所以是随机纹理，重点看**形状**和**非负**）。
+"""))
+
+cells.append(code(r"""
+# === 内联复刻 CocoaLikeObject2D（与 scripts/run_cocoa_like_2d_mechanism.py:280 一致）===
+# 注意：故意不 import 那个脚本，因为它在 import 时会调用 matplotlib.use("Agg")，会让 notebook 里画不出图。
+import torch.nn as nn
+import torch.nn.functional as F
+from hybrid_ring_cocoa.object.nerf import NeuralObject2D
+from hybrid_ring_cocoa.object.coords import make_coord_grid_2d
+from hybrid_ring_cocoa.object.encoding import radial_fourier_encoding
+
+class CocoaLikeObject2D(NeuralObject2D):
+    # NeuralObject2D（坐标 MLP）加上 CoCoA 风格的"正值、封顶"渲染
+    def __init__(self, *, max_val=40.0, beta=1.0, output_mode="softplus"):
+        super().__init__()
+        self.max_val = float(max_val)
+        self.beta = float(beta)
+        self.output_mode = output_mode
+
+    def render(self, width, height):
+        ref = next(self.parameters())
+        coords = make_coord_grid_2d(width, height, device=ref.device, dtype=ref.dtype)
+        raw = self.forward(radial_fourier_encoding(coords)).view(width, height)
+        if self.output_mode == "sigmoid":
+            out = self.max_val * torch.sigmoid(raw)
+        else:  # softplus
+            out = F.softplus(raw, beta=self.beta)
+        return torch.minimum(out, torch.full_like(out, self.max_val))
+
+# 建一个随机初始化的 object，render 一张 64x64
+net_demo = CocoaLikeObject2D(max_val=40.0, beta=1.0, output_mode="softplus").to(DEVICE)
+n_params = sum(p.numel() for p in net_demo.parameters())
+with torch.no_grad():
+    img0 = net_demo.render(64, 64)
+
+print(f"object MLP 参数量 = {n_params:,}")
+print(f"render 输出 shape = {tuple(img0.shape)}  (= 一整张 2D 图)")
+print(f"输出范围 min={img0.min():.4f}  max={img0.max():.4f}  (softplus 保证 >= 0)")
+
+plt.figure(figsize=(4, 4))
+plt.imshow(img0.cpu().numpy(), cmap="gray"); plt.title("random-init object.render(64,64)")
+plt.axis("off"); plt.show()
+"""))
+
+cells.append(md(r"""
+## 2.3 改动二：Softplus 正值输出（+ `max_val` 封顶）
+
+荧光强度**不可能是负的**。普通 MLP 输出可正可负，所以我们在最后套一个 **Softplus**
+把输出压成非负，再用 `max_val=40` 封一个上限，避免个别像素爆炸。下面画一下 softplus 的形状。
+"""))
+
+cells.append(code(r"""
+x = torch.linspace(-6, 8, 400)
+y_softplus = F.softplus(x, beta=1.0)
+y_capped = torch.minimum(y_softplus, torch.full_like(y_softplus, 4.0))  # 用 cap=4 演示封顶
+
+plt.figure(figsize=(6.4, 4))
+plt.plot(x, x, "--", color="gray", alpha=0.6, label="raw MLP output (can be < 0)")
+plt.plot(x, y_softplus, label="softplus(raw)  >= 0")
+plt.plot(x, y_capped, label="softplus then cap at 4 (here)")
+plt.axhline(0, color="black", lw=0.8, alpha=0.4)
+plt.xlabel("raw"); plt.ylabel("rendered value"); plt.title("Softplus positive output + cap")
+plt.legend(); plt.grid(alpha=0.25); plt.show()
+print("要点：负的 raw 被压到接近 0；正的 raw 近似线性通过；最后再封一个上限。")
+"""))
+
+cells.append(md(r"""
+## 2.4 改动三：RSD 对比先验（reciprocal std / mean）
+
+盲恢复很容易"偷懒"——网络可能输出一张**又平又糊**的图，照样能让模糊后的预测对上测量图。
+为了逼它产生**有对比、有细节**的 object，CoCoA 加了一个 **RSD (reciprocal standard-deviation) 先验**：
+
+```
+contrast = std(img) / mean(img)        # 对比度（越大越有反差）
+RSD loss = 1 / contrast                # 对比越低，loss 越大 -> 优化器被推着提高对比
+```
+
+下面对"高对比"和"低对比"两张图各算一次，看数值差异。
+"""))
+
+cells.append(code(r"""
+# === 内联复刻 reciprocal_std_contrast_loss（与脚本 :337 一致）===
+def reciprocal_std_contrast_loss(img, eps=1e-8):
+    mean = torch.mean(img).clamp_min(eps)
+    contrast = torch.std(img) / mean
+    return torch.reciprocal(contrast.clamp_min(eps))
+
+# 高对比图：黑白棋盘格；低对比图：几乎均匀的灰
+hi = torch.zeros(64, 64); hi[::8, :] = 1.0; hi[:, ::8] = 1.0          # 明显反差
+lo = 0.5 + 0.01 * torch.randn(64, 64)                                 # 几乎全灰
+
+print(f"高对比图: std/mean = {(hi.std()/hi.mean()):.3f}  ->  RSD loss = {reciprocal_std_contrast_loss(hi):.3f}")
+print(f"低对比图: std/mean = {(lo.std()/lo.mean()):.3f}  ->  RSD loss = {reciprocal_std_contrast_loss(lo):.3f}")
+print("低对比 -> RSD loss 大很多 -> 训练时这一项会把 object 往'更有对比'推。")
+
+fig, ax = plt.subplots(1, 2, figsize=(7, 3.6))
+ax[0].imshow(hi, cmap="gray"); ax[0].set_title("high contrast (low RSD loss)"); ax[0].axis("off")
+ax[1].imshow(lo, cmap="gray", vmin=0, vmax=1); ax[1].set_title("low contrast (high RSD loss)"); ax[1].axis("off")
+plt.tight_layout(); plt.show()
+"""))
+
+cells.append(md(r"""
+## 2.5 改动四：5× measurement 预训练 + 默认不加 xy-TV
+
+- **5× 预训练**：正式联合训练前，先让 object 网络去拟合 **5 倍亮度的测量图**（只用 SSIM loss）。
+  这相当于给 object 一个**合理的初值**（大致的结构和位置），让后面的联合优化不至于从纯噪声开始。
+  代码见 `pretrain_cocoa_like`(脚本 ≈345)。
+- **默认不加 xy-TV**：TV（total variation）是常见的"抹平"正则。这里默认 `tv_weight=0`，
+  因为对比靠 RSD 来管，避免 TV 把细节也一起抹掉；需要时可用 `--tv-weight` 打开。
+
+到这里，"我把 model 改成了什么"就讲完了。接下来看这套 object 怎么接到**前向物理模型**上。
+"""))
+
+# ──────────────────────────────────────────────────────────────────────────
+# 3. forward model
+# ──────────────────────────────────────────────────────────────────────────
+cells.append(md(r"""
+# ③ Forward model：Seidel → PSF → ring 卷积
+
+**本章读法**
+
+- **动机**：说明物理 forward 没有被换掉，避免 mentor 以为我们重新发明了模糊模型。
+- **做法**：Seidel 系数先生成每个环的 PSF，再对 object 做 ring convolution。
+- **怎么读**：如果 forward 正确，frozen 模式应当能给出 object 恢复上界。
+- **一句话结论**：CoCoA-like 只改 object side，Seidel ring forward 是物理约束。
+
+这一步是**物理**部分，整个项目里**保持不变**（CoCoA-like 只改 object/loss，不改 forward）。
+它把"清晰 object + 6 个 Seidel 系数"变成"模糊 measurement"：
+
+```
+6 个 Seidel 系数 ──> 每个半径环的 PSF（小光斑）──> ring convolution ──> 模糊图
+```
+
+下面用真实代码跑一遍：拿一张清晰图当 object，用 **UCLA 预设**的 Seidel 系数把它变模糊。
+（这就是合成"测量图"的方式，也是后面所有实验的 ground-truth 来源。）
+"""))
+
+cells.append(code(r"""
+from hybrid_ring_cocoa import load_baboon_gt, synthesize_measurement
+
+SYS_PARAMS = {"NA": 0.45, "lamb": 0.55e-6}                 # 光学系统参数（数值孔径 / 波长）
+UCLA = [0.9157, 0.3318, 0.0081, 0.2914, 0.0, 0.0]          # UCLA 预设 Seidel: [球差,彗差,像散,场曲,畸变,离焦]
+
+# 找一张项目自带的清晰模拟图当 object（Test_figure_1 就是 baseline 用的 "fluorescence" 图）
+IMG_PATH = next((p for p in [
+    PROJECT_ROOT / "hybrid_ring_cocoa" / "data" / "sharpe_simulation_figure_package" / "Test_figure_1.png",
+    PROJECT_ROOT / "hybrid_ring_cocoa" / "data" / "baboon.png",
+] if p.is_file()), None)
+
+SIZE = 96
+sharp = load_baboon_gt(SIZE, path=IMG_PATH, device=DEVICE)  # load_baboon_gt 支持 path= 加载任意图
+seidel_gt = torch.tensor(UCLA, dtype=torch.float32, device=DEVICE)
+meas = synthesize_measurement(sharp, seidel_gt, SYS_PARAMS)  # 前向：清晰 -> 模糊
+
+def hf_ratio(t):  # 高频能量占比：越高越"锐"，越低越"糊"
+    a = t.detach().cpu().numpy().astype(np.float64); a = a - a.mean()
+    spec = np.abs(np.fft.fftshift(np.fft.fft2(a)))**2
+    h, w = a.shape; yy, xx = np.mgrid[:h, :w]
+    r = np.sqrt((yy-(h-1)/2)**2 + (xx-(w-1)/2)**2); rmax = np.sqrt(((h-1)/2)**2 + ((w-1)/2)**2)
+    return float(spec[r >= 0.25*rmax].sum() / max(spec.sum(), 1e-20))
+
+print(f"清晰 object  HF ratio = {hf_ratio(sharp):.4f}")
+print(f"模糊 measurement HF ratio = {hf_ratio(meas):.4f}   (糊了 -> 高频被砍掉很多)")
+
+fig, ax = plt.subplots(1, 2, figsize=(8, 4))
+ax[0].imshow(sharp.cpu().numpy(), cmap="gray"); ax[0].set_title("sharp object (GT)"); ax[0].axis("off")
+ax[1].imshow(meas.cpu().numpy(), cmap="gray"); ax[1].set_title("measurement = ring-blur(object, Seidel)"); ax[1].axis("off")
+plt.tight_layout(); plt.show()
+"""))
+
+cells.append(md(r"""
+## 3.1 Seidel 约定：classical4d / 5d / 6d（哪些系数被"钉死"）
+
+不是每次都解全部 6 个系数。我们用"约定 (convention)"来决定**哪些系数被固定为 0、不参与优化**：
+
+| 约定 | 优化的系数 | 钉死为 0 的下标 | 含义 |
+|---|---|---|---|
+| `classical4d` | `[W040, W131, W222, W220]` | `[4, 5]` | 不解畸变、不解离焦 |
+| `classical5d` | `+ W311` | `[5]` | 不解离焦 |
+| `classical6d`/`backend6` | 全部 6 个 | `[]` | 全解（最自由） |
+
+为什么要钉死？因为有些系数（尤其离焦 Wd）和 object 之间**互相抵消、谁也定不下来**（歧义），
+钉死它们能让问题更稳定。后面 ⑦ 的 operator 实验会比较 4D/5D/6D 谁更稳。
+"""))
+
+# ──────────────────────────────────────────────────────────────────────────
+# 4. 训练 joint vs frozen
+# ──────────────────────────────────────────────────────────────────────────
+cells.append(md(r"""
+# ④ 训练怎么跑：joint vs frozen
+
+**本章读法**
+
+- **动机**：把"理想上界"和"真正盲恢复"分开，结果才不会混在一起解释。
+- **做法**：`frozen` 固定 GT Seidel 只训 object；`joint` 同时训 object 和 Seidel。
+- **怎么读**：frozen 好说明 object model 够强；joint 差说明 blind Seidel/object 歧义还在。
+- **一句话结论**：joint 是目标任务，frozen 是判断 object 机制是否可行的参照上界。
+
+我们有两种训练模式，理解它们的区别是看懂结果的关键：
+
+- **frozen（参照上界）**：把 Seidel **固定在真值 GT**，只优化 object。
+  这是"如果我已经知道像差，object 最好能恢复成什么样"的**理想上界**。
+- **joint（真盲恢复）**：object 和 Seidel **一起优化**，Seidel 从 0 开始。
+  这才是真实任务——像差也是未知的。
+
+## 4.1 训练循环（核心逻辑）
+
+每一步都做这几件事（对应 `train_cocoa_like`，脚本 ≈374）：
+
+```
+sharp      = object.render(H, W)                 # 当前 object
+meas_pred  = ring_blur(sharp, seidel)            # 用当前 Seidel 把它变模糊
+loss = SSIM(meas_pred, meas_gt)                  # 主项：预测的模糊图要像真实测量
+     + rsd_weight * RSD(sharp)                   # 对比先验：逼 object 有细节
+     + tv_weight  * TV(sharp)                    # 默认 0
+     + anchor_weight * (把 Wd 拉向 0)            # 离焦锚，压住最爱乱跑的离焦
+loss.backward(); optimizer.step()                # Adam 同时更新 object 权重和 Seidel
+```
+
+优化器是 **Adam**，学习率用 **cosine 退火**；object 和 Seidel 用**不同的学习率**
+（`lr_obj=5e-3`, `lr_seidel=1e-2`）。下面**只跑一步**，证明这个 loop 能动、Seidel 真的被更新了。
+"""))
+
+cells.append(code(r"""
+from hybrid_ring_cocoa import ssim_loss, blur_ring_trainable, build_sys_params
+
+# joint 模式：object 随机初始化，Seidel 从全 0 开始
+net = CocoaLikeObject2D(max_val=40.0, beta=1.0).to(DEVICE)
+seidel = nn.Parameter(torch.zeros(6, device=DEVICE, dtype=torch.float32))
+resolved_sys = build_sys_params(SIZE, SYS_PARAMS)        # ring 卷积需要的完整系统参数
+opt = torch.optim.Adam([
+    {"params": net.parameters(), "lr": 5e-3},
+    {"params": [seidel],        "lr": 1e-2},
+])
+
+print("训练前 Seidel =", [round(float(v), 4) for v in seidel.detach()])
+
+# —— 单步训练（演示用；真实实验是几百~上千步，这里不跑满）——
+sharp_pred = net.render(SIZE, SIZE)
+meas_pred = blur_ring_trainable(sharp_pred, seidel, resolved_sys)
+l_ssim = ssim_loss(meas_pred, meas)                       # meas 来自 ③ 的合成测量图
+l_rsd  = reciprocal_std_contrast_loss(sharp_pred)
+loss = l_ssim + 5e-4 * l_rsd
+opt.zero_grad(); loss.backward(); opt.step()
+
+print("训练后 Seidel =", [round(float(v), 4) for v in seidel.detach()], " <- 已被更新（不再全 0）")
+print(f"loss 分量: ssim={float(l_ssim):.4f}  rsd={float(l_rsd):.4f}  total={float(loss):.4f}")
+print("（真实训练会重复这一步 pretrain 400 + joint 1000 次，结果在 ⑥ 直接加载，不在此现场跑）")
+"""))
+
+# ──────────────────────────────────────────────────────────────────────────
+# 5. evaluator
+# ──────────────────────────────────────────────────────────────────────────
+cells.append(md(r"""
+# ⑤ Evaluator 怎么设定（核心章）
+
+**本章读法**
+
+- **动机**：Seidel 系数可能不同但产生几乎相同的模糊算子，所以 coefficient L2 不够。
+- **做法**：用固定 probe images 比较 GT forward operator 和 recovered forward operator 的输出。
+- **怎么读**：`phys_equiv` 是主要物理等价指标；`coord_diagnostic` 只看镜像/坐标歧义信号。
+- **一句话结论**：最终判断恢复是否成功，应该看"算子是否等价"，不是只看系数逐项是否相同。
+
+这是整个项目**最容易被忽视、但最关键**的设计。先讲**为什么需要一个专门的 evaluator**。
+
+## 5.1 为什么不能只看"系数 L2 误差"
+
+盲恢复有一个本质难题：**等价模糊歧义**。两组**不同**的 Seidel 系数，可能产生**几乎一模一样**的模糊算子
+（例如所谓 twin / 镜像对称）。这时候：
+
+- 如果只看 **系数 L2**（恢复值和真值逐项差多少），会判它"失败"——因为数值不一样；
+- 但其实它俩**在物理上等价**，模糊效果一样，object 也能恢复得一样好。
+
+所以我们需要两层指标：
+
+| 层面 | 指标 | 问的问题 |
+|---|---|---|
+| **系数层面** | `seidel L2` / `relative wavefront error` | 恢复的系数逐项接近真值吗？ |
+| **operator 层面**（更重要） | `operator_error` | 把恢复的系数当成**物理模糊算子**，它和真算子作用效果有多接近？ |
+
+## 5.2 operator_error 是怎么算的
+
+思路很直接：**不比系数，比算子作用的效果**。
+
+1. 准备一组**固定的探针图 (probe)**——确定性、L2 归一化，默认权重全是 1：
+   `delta_grid`（3×3 网格点冲激，共 9 张）、`radial_basis`（4 张径向高斯环）、
+   `fourier`（5 个频率方向，正弦/余弦共 10 张）、`random`（4 张 fixed-seed Rademacher 随机 probe，seed=1729）。
+2. 把每个 probe 分别用**真 Seidel 算子**和**恢复 Seidel 算子**各模糊一次。
+3. 比较两者输出的差异 → 取加权平均 = `operator_error`（越低越好）。
+
+## 5.3 三档 operator_error（处理对称歧义）
+
+因为 twin / mirror 这类变换**不改变物理算子**，evaluator 会输出三个版本：
+
+- `operator_error_calibrated`：**严格**只用恒等变换 `{I}` 比较（最保守）。
+- `operator_error_phys_equiv`：允许 `{I, twin}`，而且 twin 必须通过 dataset / GT / recovered 三层 gate；
+  这是判定"是否真的恢复成功"的主指标。
+- `operator_error_coord_diagnostic`：允许 `{I, mirror_x, twin, twin_mirror}`，只用来诊断镜像/坐标约定歧义，
+  **不算** primary success criterion。
+
+> 真实代码：`hybrid_ring_cocoa/evaluation/seidel_operator_evaluator.py`，
+> 公开入口 `evaluate_seidel_recovery(...)`。下面直接调用它，看输出长什么样。
+"""))
+
+cells.append(md(r"""
+## 5.4 把 evaluator 的 probe 画出来
+
+下面这张图是为了**汇报展示**用的：它把 evaluator 内部使用的 probe family 可视化出来。
+
+注意：真实 evaluator 默认**不会保存这些图**，它只是把这些 probe 当作测试输入来算 `operator_error`。
+这里画出来，是为了让 mentor 直观看到：
+
+```
+同一个 probe → 真 Seidel 算子输出
+           → 恢复 Seidel 算子输出
+比较两张输出的差异 = operator_error 的来源
+```
+"""))
+
+cells.append(code(r"""
+from hybrid_ring_cocoa.evaluation import OperatorProbeConfig
+from hybrid_ring_cocoa.evaluation.seidel_operator_evaluator import build_operator_probe_groups
+from hybrid_ring_cocoa import synthesize_measurement
+
+DIM_PROBE = 64
+probe_config = OperatorProbeConfig()  # 默认 evaluator 配置
+probe_groups = build_operator_probe_groups(DIM_PROBE, probe_config, device=DEVICE)
+
+# 为了展示，把 9 个 delta probe 合成一张图；真实 evaluator 是逐张分别算。
+delta_grid_show = torch.stack(probe_groups["delta_grid"]).sum(dim=0)
+viz_probes = {
+    "delta_grid (9 points)": delta_grid_show,
+    "radial_basis (one ring)": probe_groups["radial_basis"][1],
+    "fourier (cos k=1,0)": probe_groups["fourier"][0],
+    "random (seed=1729)": probe_groups["random"][0],
+}
+
+def to_np(x):
+    return x.detach().cpu().numpy()
+
+fig, axes = plt.subplots(1, 4, figsize=(13.5, 3.2))
+for ax, (name, probe) in zip(axes, viz_probes.items()):
+    arr = to_np(probe)
+    vmax = float(np.max(np.abs(arr))) or 1.0
+    ax.imshow(arr, cmap="coolwarm", vmin=-vmax, vmax=vmax)
+    ax.set_title(name, fontsize=9)
+    ax.axis("off")
+fig.suptitle("Evaluator probe families (visualization only)", fontsize=12)
+plt.tight_layout(); plt.show()
+
+# 再拿一个 probe 做 operator 对比：同一张输入，分别经过 GT Seidel 和 recovered Seidel。
+probe_for_operator = probe_groups["radial_basis"][1]
+gt6_demo  = torch.tensor([0.9157, 0.3318, 0.0081, 0.2914, 0.0, 0.0], dtype=torch.float32, device=DEVICE)
+hat6_demo = torch.tensor([0.3913, -0.0976, 0.0206, 0.1752, -0.0981, 0.0], dtype=torch.float32, device=DEVICE)
+
+gt_out = synthesize_measurement(probe_for_operator, gt6_demo, SYS_PARAMS)
+hat_out = synthesize_measurement(probe_for_operator, hat6_demo, SYS_PARAMS)
+diff = hat_out - gt_out
+
+fig, axes = plt.subplots(1, 4, figsize=(14, 3.3))
+panels = [
+    ("input probe", probe_for_operator, "viridis"),
+    ("GT operator output", gt_out, "viridis"),
+    ("recovered operator output", hat_out, "viridis"),
+    ("difference", diff, "coolwarm"),
+]
+for ax, (title, img, cmap) in zip(axes, panels):
+    arr = to_np(img)
+    if cmap == "coolwarm":
+        vmax = float(np.max(np.abs(arr))) or 1.0
+        ax.imshow(arr, cmap=cmap, vmin=-vmax, vmax=vmax)
+    else:
+        ax.imshow(arr, cmap=cmap)
+    ax.set_title(title, fontsize=9)
+    ax.axis("off")
+fig.suptitle("What operator_error compares: A_gt(probe) vs A_hat(probe)", fontsize=12)
+plt.tight_layout(); plt.show()
+
+num = torch.sum((hat_out - gt_out) ** 2).sqrt()
+den = torch.sum(gt_out ** 2).sqrt().clamp_min(1e-12)
+print(f"这个单个 probe 的相对输出差异 = {float(num / den):.4f}")
+print("真实 operator_error 会对所有 probe group 做加权平均，不只看这一张。")
+"""))
+
+cells.append(code(r"""
+from hybrid_ring_cocoa.evaluation import evaluate_seidel_recovery
+
+# 用一组"类似 baseline 联合恢复"的系数当 hat，和 UCLA 真值比
+gt6  = [0.9157, 0.3318, 0.0081, 0.2914, 0.0, 0.0]          # 真值 (UCLA)
+hat6 = [0.39, -0.10, 0.02, 0.18, -0.10, 0.0]               # 恢复值（接近 baseline joint 的结果）
+
+res = evaluate_seidel_recovery(
+    theta_gt=gt6,
+    theta_hat=hat6,
+    dim=64,                         # 评估用的图像尺寸（小一点跑得快）
+    sys_params=SYS_PARAMS,
+    fixed_indices=[],               # classical6d：不钉死任何系数
+    probe_config=None,              # 用默认 probe 组
+    dataset_twin_invariance_pass=True,
+)
+
+print("=== evaluate_seidel_recovery 输出（节选）===")
+for k in [
+    "operator_error_calibrated",
+    "operator_error_phys_equiv",
+    "operator_error_coord_diagnostic",
+    "wavefront_error_calibrated",
+    "raw_coeff_relative_error",
+    "best_physical_transform",
+    "twin_allowed_for_sample",
+]:
+    print(f"  {k:38s} = {res[k]}")
+
+print("\n解读：operator_error_* 越低越说明'恢复算子≈真算子'；")
+print("     raw_coeff_relative_error 是纯系数误差，常常比 operator error 大（因为有等价歧义）。")
+"""))
+
+cells.append(md(r"""
+> **重要提醒（README 也强调）**：`operator_error_calibrated` 这种 *strict-only* 指标**不能**直接当作
+> 最终的"物理等价分数"。判断恢复是否真的成功，要看 `operator_error_phys_equiv`（允许物理等价变换后）。
+> strict 和 phys_equiv 的差距，本身就是"歧义有多大"的信号。
+
+到这里，前 5 章把**方法 + 评估口径**讲清楚了。接下来全是**结果**。
+"""))
+
+# ──────────────────────────────────────────────────────────────────────────
+# 6. baseline
+# ──────────────────────────────────────────────────────────────────────────
+cells.append(md(r"""
+# ⑥ Baseline 结果：joint vs frozen
+
+**本章读法**
+
+- **动机**：用一个最代表性的 case 快速回答"这套改动有没有用"。
+- **做法**：比较 frozen 上界和 joint blind recovery。
+- **怎么读**：先看 object 指标 SSIM/HF，再看 Seidel L2；二者不一致时要回到 evaluator 的歧义解释。
+- **一句话结论**：object 可以明显变清楚，但 joint Seidel 没有完全回到 GT。
+
+这是最有代表性的一次 run：`fluorescence` 图、`256×256`、UCLA 像差、pretrain 400 + joint 1000 步。
+我们**直接加载已经跑好的** `summary.json`，对比 frozen（已知像差的上界）和 joint（真盲恢复）。
+"""))
+
+cells.append(code(r"""
+BASE = OUT / "cocoa_like2d_fluor256_ucla_pre400_joint1000_seed0"
+summ_path = BASE / "summary.json"
+if summ_path.is_file():
+    summ = json.loads(summ_path.read_text())
+    rows = []
+    for mode in ["frozen", "joint"]:
+        m = summ["modes"][mode]
+        rows.append({
+            "mode": mode,
+            "SSIM (recon vs GT)": round(m["ssim_recon_gain_vs_gt"], 4),
+            "MS-SSIM": round(m["msssim_recon_gain_vs_gt"], 4),
+            "recon HF ratio": round(m["recon_raw_hf_ratio"], 4),
+            "Seidel L2 vs GT": round(m["l2_seidel_vs_gt"], 4),
+        })
+    base_df = pd.DataFrame(rows).set_index("mode")
+    display(base_df)
+
+    j = summ["modes"]["joint"]
+    print(f"参考: GT object HF ratio   = {j['gt_hf_ratio']:.4f}")
+    print(f"参考: measurement HF ratio = {j['measurement_hf_ratio']:.4f}  (糊；joint recon 把它从这里拉到 {j['recon_raw_hf_ratio']:.4f})")
+    print(f"joint 恢复的 Seidel = {[round(v,3) for v in j['seidel_final']]}")
+    print(f"真值   的 Seidel   = {[round(v,3) for v in j['seidel_gt']]}")
+else:
+    print("（缺 summary.json，跳过表格）", summ_path)
+
+# 五连图：GT / measurement / recon / pred-meas / error（已生成好的对比图）
+show_pngs([BASE / "summary_comparison.png"],
+          titles=["baseline summary: rows = [joint, frozen], cols = GT / meas / recon / pred-meas / err"],
+          ncols=1, per=(15, 6.5))
+"""))
+
+cells.append(md(r"""
+## 6.1 这张 baseline 说明了什么（结论）
+
+- **frozen（已知像差）**：`SSIM=0.9416`，`HF=0.3800`——object 恢复得非常清晰，几乎到 GT 水平。
+  说明只要像差对了，**CoCoA-like 的 object 机制足够强**。
+- **joint（盲恢复）**：`SSIM=0.6326`、`MS-SSIM=0.8745`，`HF=0.2519`——比模糊的 measurement（`HF=0.01247`）
+  **锐很多**，object 明显被解模糊了；但 **Seidel 没恢复到真值**（`L2=0.6948`），所以会出现一些伪结构。
+
+> **一句话结论（可以直接对 mentor 讲）**：CoCoA-like 的 object 机制能解决很大一部分模糊，
+> 但**盲联合下 Seidel / object 之间的歧义仍然存在**——这正是后面所有实验要去量化和缓解的核心问题。
+"""))
+
+# ──────────────────────────────────────────────────────────────────────────
+# 7. 实验族
+# ──────────────────────────────────────────────────────────────────────────
+cells.append(md(r"""
+# ⑦ 我设计了哪些实验（全部实验族）
+
+围绕"盲 Seidel 歧义"这个核心问题，我设计了一整套实验。它们被整理在 `experiments/` 目录下
+（`00_catalog/EXPERIMENT_MANIFEST.md` 把友好名映射回 `outputs/` 真实路径）。下面**逐族**讲：
+**动机 → 设计 → 怎么读 → 真实结果 → 一句话结论**。
+
+| 编号 | 实验族 | 回答的问题 |
+|---|---|---|
+| 7.1 | Seidel recovery operator sweep | 哪些像差方向在 forward-operator 口径下好恢复，哪些难？ |
+| 7.2 | object-prior parameter sweep | object 先验的超参（beta/rsd/max_val）怎么选最好？ |
+| 7.3 | operator evaluation | 用 operator 口径，4D/5D/6D 谁最稳？ |
+| 7.4 | symmetry ablation | 模型参数越多越好吗？泛化间隙多大？ |
+| 7.5 | blind recovery sanity | 盲恢复在不同强度下的 operator 误差与"规范泄漏"？ |
+| 7.6 | regression & smoke | forward model 有没有被改坏（回归护栏）？ |
+| 7.7 | real-measurement | 在真实测量数据上重建效果如何？ |
+"""))
+
+# 7.1 operator sweep
+cells.append(md(r"""
+## 7.1 Seidel recovery operator sweep
+
+- **动机**：不是所有像差都一样好恢复。我想知道**哪些方向、哪些强度**容易/困难。
+- **设计**：这里改用已经完成的 physical operator evaluator summary，比较 size256 的 `4D / 5D / 6D`
+  sweep，并按 `direction` 汇总。
+- **怎么读**：主指标是 `operator_error_calibrated`，也就是**只用原坐标、原符号**跑 probe forward model 后比较输出。
+  它越低，说明 recovered Seidel 产生的模糊算子越接近 GT；`coord_diagnostic_gain` 只用来提示镜像/坐标歧义。
+"""))
+
+cells.append(code(r"""
+OPDIR = OUT / "seidel_operator_eval_summary" / "direction_summary.csv"
+dsum = read_csv(OPDIR)
+if dsum is not None:
+    size256 = dsum[dsum["sweep"].astype(str).str.startswith("size256")].copy()
+    print(f"size256 operator summary 行数 = {len(size256)}")
+
+    agg = (size256.groupby("direction")
+           .agg(operator_error_calibrated=("operator_calibrated_mean", "mean"),
+                operator_error_phys_equiv=("operator_phys_equiv_mean", "mean"),
+                operator_error_coord_diagnostic=("operator_coord_diagnostic_mean", "mean"),
+                coord_diagnostic_gain=("coord_diagnostic_gain_mean", "mean"),
+                aligned_wf_physical=("aligned_wavefront_error_physical_mean", "mean"),
+                rows=("rows", "sum"))
+           .sort_values("operator_error_calibrated")
+           .round(4))
+
+    display(Markdown("**按像差方向看难易度：主指标 = `operator_error_calibrated`（越低越好）**"))
+    display(agg)
+
+    pivot = (size256.pivot_table(index="direction",
+                                 columns="sweep",
+                                 values="operator_calibrated_mean",
+                                 aggfunc="mean")
+             .loc[agg.index]
+             .round(4))
+    display(Markdown("**同一个方向在 size256 4D / 5D / 6D 下的 calibrated operator error**"))
+    display(pivot)
+
+    fig, ax = plt.subplots(figsize=(8.8, 3.8))
+    bars = ax.bar(agg.index.astype(str),
+                  agg["operator_error_calibrated"].values,
+                  color="#3B82B8")
+    ax.set_ylabel("mean operator_error_calibrated")
+    ax.set_title("size256 direction difficulty by calibrated operator error")
+    ax.bar_label(bars, fmt="%.3f", padding=2, fontsize=8)
+    plt.xticks(rotation=30, ha="right")
+    plt.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    plt.show()
+
+    fig, ax = plt.subplots(figsize=(8.8, 3.8))
+    ax.bar(agg.index.astype(str),
+           agg["coord_diagnostic_gain"].values,
+           color="#F58518")
+    ax.set_ylabel("coord diagnostic gain")
+    ax.set_title("how much mirror/coordinate diagnostic reduces operator error")
+    plt.xticks(rotation=30, ha="right")
+    plt.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    plt.show()
+else:
+    ACC = OUT / "seidel_recovery_sweep_stage1_size256_fullbudget_gpu1"
+    df = read_csv(ACC / "stage1_metrics.csv")
+    if df is not None:
+        print("fallback: operator summary 不在本地，只展示旧的 wavefront diagnostic。")
+        print(f"stage1 行数 = {len(df)}")
+        agg = (df.groupby("direction")
+                 .agg(relative_wavefront_error=("relative_wavefront_error", "mean"),
+                      signblind_relative_wavefront_error=("signblind_relative_wavefront_error", "mean"),
+                      ssim=("ssim_recon_gain_vs_gt", "mean"),
+                      hf_drop=("measurement_hf_drop", "mean"),
+                      n=("relative_wavefront_error", "size"))
+                 .sort_values("relative_wavefront_error").round(4))
+        display(agg)
+"""))
+
+cells.append(md(r"""
+**一句话结论**：在 `operator_error_calibrated` 口径下，`signed_balanced / cocoa_signed`
+这类方向最好恢复，`coma_dominant` 最难；`coord_diagnostic_gain` 大的方向说明可能还存在镜像/坐标约定歧义。
+`relative_wavefront_error` 只作为辅助诊断，不再是这一节的主结论。
+"""))
+
+# 7.2 object-prior
+cells.append(md(r"""
+## 7.2 object-prior parameter sweep
+
+- **动机**：②里那些 object 先验有超参（`nerf_beta`、`rsd_weight`、`max_val`、学习率）。到底怎么选？
+- **设计**：在 size512 上做网格扫描，**用 operator 口径**（而不是只看好不好看）来挑参数。
+- **怎么读**：`operator_error_calibrated` 越低越好；同时兼顾 object 的 `ssim_recon_gain_vs_gt`。
+"""))
+
+cells.append(code(r"""
+OBJP = (OUT / "object_prior_param_sweep_size512_focused_seidelmetric"
+            / "stage1_seidel_physical_operator_eval_dim512"
+            / "seidel_physical_operator_metrics.csv")
+dfp = read_csv(OBJP)
+if dfp is not None:
+    dfp = dfp.copy()
+    dfp["param"] = dfp.apply(
+        lambda r: f"{r['output_mode']}|max{int(r['max_val'])}|rsd{r['rsd_weight']:g}|beta{int(r['nerf_beta'])}",
+        axis=1)
+    top = (dfp.groupby("param")
+              .agg(operator_err=("operator_error_calibrated", "mean"),
+                   ssim=("ssim_recon_gain_vs_gt", "mean"),
+                   hf_ratio=("recon_gain_hf_to_gt_hf", "mean"),
+                   n=("operator_error_calibrated", "size"))
+              .sort_values("operator_err").round(5))
+    display(Markdown("**operator 口径下最好的若干参数组合（operator_err 越低越好）**"))
+    display(top.head(10))
+
+    # beta 的主效应
+    beta_tbl = dfp.groupby("nerf_beta")["operator_error_calibrated"].mean().round(5)
+    print("nerf_beta 主效应（mean operator error）:")
+    print(beta_tbl.to_string())
+"""))
+
+cells.append(md(r"""
+### 7.2.1 统计图怎么读
+
+这些图是 sweep 已经生成好的**统计总结**，不是重新训练：
+
+- `heatmap_param_effects`：看每个超参组合的总体效果，帮助快速找稳定区域。
+- `max_val_beta_grid`：专门看 `max_val × nerf_beta` 的组合效应。
+- `rsd_weight_vs_recovery`：看 RSD 对比先验权重是否帮恢复。
+- `object_sharpness_vs_wavefront_error`：检查 object 变清晰和 Seidel/wavefront 恢复之间是否一致。
+- `overview_top_param_configs`：把最好的若干配置和对应结果放在一起，方便汇报时直接指图讲。
+- `stage3_stability_bar`：看最终候选在不同 seed 下是否稳定（如果 focused sweep 没有这张，就从早期 full sweep 里展示）。
+"""))
+
+cells.append(code(r"""
+OBJROOT = OUT / "object_prior_param_sweep_size512_focused_seidelmetric"
+OBJROOT_LEGACY = OUT / "object_prior_param_sweep_20260525_full"
+
+def first_existing_png(name):
+    for root in [OBJROOT, OBJROOT_LEGACY]:
+        p = root / name
+        if p.is_file():
+            return p
+    return OBJROOT / name
+
+param_effect_pngs = [
+    first_existing_png("heatmap_param_effects.png"),
+    first_existing_png("max_val_beta_grid.png"),
+    first_existing_png("rsd_weight_vs_recovery.png"),
+    first_existing_png("object_sharpness_vs_wavefront_error.png"),
+]
+show_pngs(
+    param_effect_pngs,
+    titles=[
+        "parameter effect heatmaps",
+        "max_val x nerf_beta grid",
+        "RSD weight vs recovery",
+        "object sharpness vs wavefront error",
+    ],
+    ncols=2,
+    per=(7.0, 5.3),
+    suptitle="object-prior sweep: parameter statistics",
+)
+
+summary_pngs = [
+    first_existing_png("overview_top_param_configs.png"),
+    first_existing_png("stage3_stability_bar.png"),
+]
+show_pngs(
+    summary_pngs,
+    titles=["top parameter configs", "stage3 seed stability"],
+    ncols=2,
+    per=(7.2, 6.0),
+    suptitle="object-prior sweep: selected configs and stability",
+)
+"""))
+
+cells.append(md(r"""
+**一句话结论**（与 `notebooks/50_object_prior_operator_report_cn` 一致）：`nerf_beta=5` 明显最稳，
+`rsd_weight` 偏中高（`1e-3` 附近）最好，`max_val` 不敏感。综合 operator + object，**推荐默认**：
+
+```
+output_mode=softplus, max_val=20, rsd_weight=1e-3, nerf_beta=5, tv_weight=0
+```
+"""))
+
+# 7.3 operator eval
+cells.append(md(r"""
+## 7.3 Operator evaluation（4D / 5D / 6D 对比）
+
+- **动机**：用 ⑤ 的 operator 口径，系统比较 `classical4d / 5d / 6d` 谁恢复得最稳。
+- **设计**：对每个尺寸/模型跑满 168 个 case，汇总 `operator_calibrated / phys_equiv / coord_diagnostic`。
+- **怎么读**：主指标 `operator_calibrated_mean` 越低越好；`coord_diagnostic` 更低说明存在镜像/坐标歧义信号。
+"""))
+
+cells.append(code(r"""
+OPV = OUT / "seidel_operator_eval_summary"
+sw = read_csv(OPV / "sweep_summary.csv")
+if sw is not None:
+    cols = ["sweep", "dim", "rows", "operator_calibrated_mean", "operator_phys_equiv_mean",
+            "operator_coord_diagnostic_mean", "twin_allowed_fraction"]
+    view = sw[[c for c in cols if c in sw.columns]].copy()
+    for c in view.columns:
+        if view[c].dtype.kind == "f":
+            view[c] = view[c].round(4)
+    display(Markdown("**各 sweep 汇总（operator_calibrated_mean 越低越好）**"))
+    display(view)
+
+top10 = read_csv(OPV / "size256_top10_4d_5d_6d.csv")
+if top10 is not None:
+    display(Markdown("**size256 跨 4D/5D/6D 的最佳 10 个 case**"))
+    display(top10.head(10))
+"""))
+
+cells.append(md(r"""
+### 7.3.1 operator-eval 统计图怎么读
+
+这几张图的主指标都是 `operator_error_calibrated`，也就是**严格原坐标/原符号**下的 forward-operator 差异。
+
+第一组看 **size256 下 4D / 5D / 6D 谁更稳**：
+
+- `distribution_by_dimension`：整体误差分布，越低越好。
+- `direction_dimension_heatmap`：每个像差方向在不同维度下的平均误差。
+- `rms_trend_by_dimension`：像差强度变大时，operator error 怎么变。
+- `direction_rms_heatmap_panels`：把 direction 和 RMS 两个难度因素放在一起看。
+- `image_dimension_heatmap`：不同图像类别对恢复难度的影响。
+- `top_bottom_candidates`：最好和最差 case 的具体例子。
+
+第二组看 **6D 模型在 size128 / 256 / 512 的变化**，读法类似：它回答的是尺寸变大以后，
+operator evaluator 的结论是否稳定。
+"""))
+
+cells.append(code(r"""
+SIZE256_VIZ = OUT / "operator_error_calibrated_size256_viz"
+show_pngs([
+    SIZE256_VIZ / "01_distribution_by_dimension.png",
+    SIZE256_VIZ / "02_direction_dimension_heatmap.png",
+    SIZE256_VIZ / "03_rms_trend_by_dimension.png",
+    SIZE256_VIZ / "05_image_dimension_heatmap.png",
+], titles=[
+    "distribution by dimension",
+    "direction x dimension heatmap",
+    "RMS trend by dimension",
+    "image x dimension heatmap",
+], ncols=2, per=(7.4, 4.8),
+   suptitle="operator_error_calibrated: size256 4D/5D/6D statistics")
+
+show_pngs([
+    SIZE256_VIZ / "04_direction_rms_heatmap_panels.png",
+    SIZE256_VIZ / "06_top_bottom_candidates.png",
+], titles=[
+    "direction x RMS heatmap panels",
+    "top and bottom candidates",
+], ncols=1, per=(12.5, 5.7),
+   suptitle="operator_error_calibrated: size256 detailed panels")
+"""))
+
+cells.append(code(r"""
+SIZE_6D_VIZ = OUT / "operator_error_calibrated_6d_size128_256_512_viz"
+show_pngs([
+    SIZE_6D_VIZ / "01_distribution_by_size.png",
+    SIZE_6D_VIZ / "02_direction_size_heatmap.png",
+    SIZE_6D_VIZ / "03_rms_trend_by_size.png",
+    SIZE_6D_VIZ / "05_image_size_heatmap.png",
+], titles=[
+    "distribution by size",
+    "direction x size heatmap",
+    "RMS trend by size",
+    "image x size heatmap",
+], ncols=2, per=(7.4, 4.8),
+   suptitle="operator_error_calibrated: 6D size128/256/512 statistics")
+
+show_pngs([
+    SIZE_6D_VIZ / "04_direction_rms_heatmap_panels.png",
+    SIZE_6D_VIZ / "06_top_bottom_candidates.png",
+    SIZE_6D_VIZ / "size512_6d_top5_per_image_four_panel.png",
+], titles=[
+    "direction x RMS heatmap panels",
+    "top and bottom candidates",
+    "size512 top5 per image",
+], ncols=1, per=(12.5, 6.6),
+   suptitle="operator_error_calibrated: 6D detailed panels")
+"""))
+
+cells.append(md(r"""
+### Evaluator 固定设置（汇报时可以一句话带过）
+
+- probe groups/weights：`delta_grid=1`, `radial_basis=1`, `fourier=1`, `random=1`。
+- probe counts：3×3 delta grid = 9，radial basis = 4，Fourier = 10，fixed random = 4。
+- physical transform set：`{I, twin}`，且 twin 要通过 exact-forward invariance gate。
+- coordinate diagnostic transform set：`{I, mirror_x, twin, twin_mirror}`，只用于诊断，不作为成功标准。
+
+**一句话结论**（摘自 `seidel_operator_eval_summary.md`）：size256 上 **4D 最低、6D 次之、5D 略高**——
+`4D mean 0.0979`，`6D mean 0.1132`，`5D mean 0.1180`。也就是说**适当少解几个系数（4D）反而更稳**，
+过参数化（6D）略微吃亏。另外 `phys_equiv` 与 `calibrated` 几乎相同（twin 已通过物理等价 gate），
+而 `coord_diagnostic` 明显更低——说明剩下的主要是**镜像/坐标约定**层面的歧义。
+"""))
+
+# 7.4 symmetry ablation
+cells.append(md(r"""
+## 7.4 Symmetry ablation（参数量 vs 误差 / 泛化）
+
+- **动机**：模型自由度（参数量）和恢复误差、泛化间隙是什么关系？是不是越多越好？
+- **设计**：对不同模型做消融，画 `参数量 vs heldout operator error`、`各模型的泛化间隙`。
+- **怎么读**：直接看下面已生成的图——heldout error 越低越好，generalization gap 越小越稳。
+"""))
+
+cells.append(code(r"""
+ABL = PROJECT_ROOT / "outputs" / "seidel_symmetry_ablation_gpu01_full" / "plots"
+show_pngs([
+    ABL / "parameter_count_vs_heldout_operator_error.png",
+    ABL / "heldout_operator_error_by_model.png",
+    ABL / "operator_error_by_model.png",
+    ABL / "generalization_gap_by_model.png",
+], titles=["param count vs heldout error", "heldout error by model",
+           "operator error by model", "generalization gap by model"],
+   ncols=2, per=(7, 5))
+"""))
+
+cells.append(md(r"""
+**一句话结论**：和 7.3 呼应——**更多参数不等于更好**；存在一个"自由度够用但不过头"的甜点区，
+过参数化会放大泛化间隙。
+"""))
+
+# 7.5 blind recovery
+cells.append(md(r"""
+## 7.5 Blind recovery sanity（误差 vs 强度 + 规范泄漏）
+
+- **动机**：在**完全盲**的设定下，operator 误差随像差强度怎么变？不同模型的"规范泄漏 (gauge leakage)"多大？
+- **设计**：dim256 的 sanity sweep，画 `operator_error vs strength`、`各模型 error 对比`、`gauge_leakage`。
+- **怎么读**：error 随强度上升是正常的；gauge leakage 越小越说明"没把能量漏到不该动的自由度上"。
+"""))
+
+cells.append(code(r"""
+BLD = PROJECT_ROOT / "outputs" / "seidel_blind_recovery_dim256_sanity" / "plots"
+show_pngs([
+    BLD / "operator_error_vs_strength.png",
+    BLD / "operator_error_reduction_by_model.png",
+    BLD / "wavefront_error_by_model.png",
+    BLD / "gauge_leakage_by_model.png",
+], titles=["operator error vs strength", "error reduction by model",
+           "wavefront error by model", "gauge leakage by model"],
+   ncols=2, per=(7, 5))
+"""))
+
+cells.append(md(r"""
+**一句话结论**：盲设定下误差随强度单调上升；不同模型的 gauge leakage 有明显差异——这进一步支持
+"选对约定（如 4D）能压住歧义"的判断。
+"""))
+
+# 7.6 regression & smoke
+cells.append(md(r"""
+## 7.6 Regression & smoke（回归护栏）
+
+- **动机**：CoCoA-like 只该改 object/loss，**绝不能动坏 forward model**。需要一个"黄金回归"持续守护。
+- **设计**：`frozen RDM forward golden regression`（固定输入比对黄金输出）+ 公开 API 的 smoke test。
+- **怎么读**：这类实验不出新结论，只确认"前向没被改坏、API 没破"。下面打印它们是否存在/完成。
+"""))
+
+cells.append(code(r"""
+checks = {
+    "golden_forward_regression_gpu0":       PROJECT_ROOT / "outputs" / "golden_forward_regression_gpu0",
+    "golden_forward_regression_gpu0_full":  PROJECT_ROOT / "outputs" / "golden_forward_regression_gpu0_full",
+}
+for name, p in checks.items():
+    status = "存在 ✓" if p.exists() else "缺失 ✗"
+    n_files = len(list(p.rglob("*"))) if p.exists() else 0
+    print(f"{name:38s} {status}  (内含 {n_files} 个文件/目录)")
+print("\n作用：每次改完代码跑一遍，forward 输出与黄金参考一致 = 没有把物理模型改坏。")
+"""))
+
+# 7.7 real measurement
+cells.append(md(r"""
+## 7.7 Real-measurement reconstructions
+
+- **动机**：合成数据上验证完，最终要看**真实测量**。在真实分辨率板数据上跑 paper-style 重建。
+- **设计**：4D / 5D / 6D 三个模型各跑一版（size512）。
+- **怎么读**：下面找出真实测量目录里已生成的对比图展示一张（若有）。
+"""))
+
+cells.append(code(r"""
+real_dirs = sorted(OUT.glob("real_measurement_resolution_target_paper_style_size512_*"))
+print("找到的 real-measurement 目录:")
+for d in real_dirs:
+    print("  ", d.name)
+
+# 从这些目录里挑前几张 PNG 展示
+pngs = []
+for d in real_dirs:
+    pngs += sorted(d.rglob("*.png"))[:1]   # 每个目录取 1 张，避免太多
+if pngs:
+    show_pngs(pngs[:3], titles=[p.parent.name[-12:] for p in pngs[:3]], ncols=1, per=(13, 5))
+else:
+    print("（这些目录下暂时没找到 PNG，跳过展示）")
+"""))
+
+cells.append(md(r"""
+**一句话结论**：在真实测量上，4D/5D/6D 都能跑出可用重建；结合 7.3/7.4 的 operator 证据，
+**4D 是当前最稳的默认选择**。
+"""))
+
+# ──────────────────────────────────────────────────────────────────────────
+# 8. 总结 & 汇报话术
+# ──────────────────────────────────────────────────────────────────────────
+cells.append(md(r"""
+# ⑧ 总结 & 怎么跟 mentor 讲
+
+## 8.1 一页式 takeaways
+
+1. **我把 model 改成了 CoCoA-like**：object = 坐标 MLP（softplus 正值 + `max_val` 封顶）、
+   加 **RSD 对比先验**、**5× measurement 预训练**、默认不加 xy-TV；**保留** 2D 输入输出 + Seidel ring forward。
+2. **训练有两档**：`frozen`（已知像差的上界）和 `joint`（真盲恢复）。
+3. **evaluator 是关键设计**：不只看系数 L2，更看 **operator 误差**（probe 作用效果），并用
+   `calibrated / phys_equiv / coord_diagnostic` 三档处理 twin/mirror **等价歧义**。
+4. **baseline 结论**：frozen 几乎完美（`SSIM 0.9416`），joint 明显解模糊（`HF 0.01247 → 0.2519`）但
+   **Seidel 未完全恢复**（`L2 0.69`）→ 盲歧义仍在。
+5. **实验族结论**：恢复难度看**像差方向**（coma 最难）；object 先验推荐 `beta=5, rsd≈1e-3`；
+   operator 口径下 **4D 最稳**（`0.0979` < 6D `0.1132` < 5D `0.1180`），**过参数化反而吃亏**；
+   forward 有黄金回归护栏；真实测量上可用。
+
+## 8.2 建议的讲述顺序（照着这个顺序讲就很顺）
+
+1. 先讲**问题**：盲恢复 + 6 个 Seidel（30 秒）。
+2. 讲**我改了什么**：CoCoA-like 四点改动 + 对照表（②）。
+3. 讲**前向 + 训练**：joint vs frozen 的区别（③④）。
+4. **重点讲 evaluator**：为什么系数 L2 不够、operator 三档怎么设（⑤）——这是你思考深度的体现。
+5. 给 **baseline 数字**：frozen vs joint（⑥）。
+6. 用**实验族**支撑结论：方向难易 / 超参 / 4D 最稳（⑦）。
+7. 收在**下一步**。
+
+## 8.3 下一步 / open questions
+
+- 盲 Seidel 歧义如何进一步**约束**（更强物理先验？多测量/多视角？）。
+- 4D 最稳是否在更难方向（coma）/更高强度下依然成立。
+- 真实测量上的**定量**评估（目前偏定性），把 operator 口径也搬到真实数据上。
+"""))
+
+cells.append(md(r"""
+# 附录
+
+## A. 关键代码索引
+
+| 文件 : 大致行 | 作用 |
+|---|---|
+| `scripts/run_cocoa_like_2d_mechanism.py:280` | `CocoaLikeObject2D`（softplus 正值 + 封顶渲染） |
+| `scripts/run_cocoa_like_2d_mechanism.py:337` | `reciprocal_std_contrast_loss`（RSD 对比先验） |
+| `scripts/run_cocoa_like_2d_mechanism.py:345` | `pretrain_cocoa_like`（5× measurement 预训练） |
+| `scripts/run_cocoa_like_2d_mechanism.py:374` | `train_cocoa_like`（joint/frozen 训练循环） |
+| `hybrid_ring_cocoa/object/nerf.py` | `NeuralObject2D`（坐标 MLP） |
+| `hybrid_ring_cocoa/object/encoding.py` | `radial_fourier_encoding`（坐标傅里叶编码） |
+| `hybrid_ring_cocoa/optics/ring_forward.py` | `blur_ring* `（ring 卷积前向） |
+| `hybrid_ring_cocoa/optics/seidel_psf.py` | `build_sys_params` / Seidel→PSF |
+| `hybrid_ring_cocoa/evaluation/seidel_operator_evaluator.py` | `evaluate_seidel_recovery`（operator evaluator） |
+
+## B. 复现命令（取自 README）
+
+```bash
+cd /Users/hongyimac/Desktop/CoCoA_like_2D_Seidel_Experiment
+python run_cocoa_like_2d_mechanism.py \
+  --image fluorescence --size 256 --modes joint frozen \
+  --pretrain-iter 400 --num-iter 1000 \
+  --run-name cocoa_like2d_fluor256_ucla_pre400_joint1000_seed0_rerun --verbose
+```
+
+## C. 指标词汇表
+
+| 名词 | 含义 |
+|---|---|
+| **SSIM / MS-SSIM** | 结构相似度（越高越像 GT object） |
+| **HF ratio** | 高频能量占比（越高越锐；measurement 很低，recon 把它拉高） |
+| **RSD** | reciprocal std/mean，对比先验（loss 大 = 对比低） |
+| **Seidel L2** | 恢复系数与真值的欧氏距离（受等价歧义影响，可能偏大） |
+| **operator_error_calibrated** | 严格(只 I)算子误差 |
+| **operator_error_phys_equiv** | 允许物理等价(twin)后的算子误差（判定成功的主指标） |
+| **operator_error_coord_diagnostic** | 再允许镜像等坐标变换（仅诊断歧义） |
+| **wavefront RMS** | 波前误差均方根（场加权） |
+| **twin / mirror** | 不改变物理算子的对称变换（造成系数歧义的元凶） |
+
+---
+*本 notebook 由 `build_mentor_report_cn.py` 生成；数据全部来自 `outputs/` 已跑好的结果，演示用 CPU 即时计算。*
+"""))
+
+
+# 给每个 cell 一个稳定 id（满足 nbformat>=4.5；避免 MissingIDFieldWarning）
+for i, c in enumerate(cells):
+    c["id"] = f"cell-{i:03d}"
+
+notebook = {
+    "cells": cells,
+    "metadata": {
+        "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+        "language_info": {
+            "codemirror_mode": {"name": "ipython", "version": 3},
+            "file_extension": ".py",
+            "mimetype": "text/x-python",
+            "name": "python",
+            "nbconvert_exporter": "python",
+            "pygments_lexer": "ipython3",
+            "version": "3.9",
+        },
+    },
+    "nbformat": 4,
+    "nbformat_minor": 5,
+}
+
+NOTEBOOK_PATH.parent.mkdir(parents=True, exist_ok=True)
+NOTEBOOK_PATH.write_text(json.dumps(notebook, ensure_ascii=False, indent=1), encoding="utf-8")
+print(f"Wrote {NOTEBOOK_PATH}  ({len(cells)} cells)")
