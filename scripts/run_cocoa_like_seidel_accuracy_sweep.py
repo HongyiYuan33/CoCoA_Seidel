@@ -189,6 +189,7 @@ def run_args_for_case(
         pretrain_scalar=sweep_args.pretrain_scalar,
         defocus_anchor_weight=sweep_args.defocus_anchor_weight,
         defocus_index=sweep_args.defocus_index,
+        seidel_rms_prior_mode=sweep_args.seidel_rms_prior_mode,
         seidel_rms_floor_weight=sweep_args.seidel_rms_floor_weight,
         seidel_rms_floor_alpha=sweep_args.seidel_rms_floor_alpha,
         seidel_rms_floor_target=candidate.actual_rms,
@@ -252,6 +253,7 @@ def augment_metrics(
             "seidel_l2_relative": coeff_rel,
             "measurement_hf_drop": 1.0 - (meas_hf / max(gt_hf, 1e-12)),
             "seidel_convention": seidel_convention,
+            "seidel_rms_prior_mode": str(config.get("seidel_rms_prior_mode", "floor")),
             "seidel_rms_floor_weight": float(config.get("seidel_rms_floor_weight", 0.0)),
             "seidel_rms_floor_alpha": float(config.get("seidel_rms_floor_alpha", 0.8)),
             "seidel_rms_floor_target": config.get("seidel_rms_floor_target"),
@@ -381,6 +383,7 @@ def write_csv(rows: list[dict], path: Path) -> None:
         "wavefront_error_rms",
         "signblind_relative_wavefront_error",
         "seidel_l2_relative",
+        "seidel_rms_prior_mode",
         "seidel_rms_floor_weight",
         "seidel_rms_floor_alpha",
         "seidel_rms_floor_target",
@@ -802,6 +805,8 @@ def run_stage1_case_subprocess(
         str(args.fourier_num_angles),
         "--fourier-num-octaves",
         str(args.fourier_num_octaves),
+        "--seidel-rms-prior-mode",
+        args.seidel_rms_prior_mode,
         "--seidel-rms-floor-weight",
         str(args.seidel_rms_floor_weight),
         "--seidel-rms-floor-alpha",
@@ -960,6 +965,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fourier-num-angles", type=int, default=60)
     parser.add_argument("--fourier-num-octaves", type=int, default=7)
+    parser.add_argument(
+        "--seidel-rms-prior-mode",
+        choices=["floor", "ratio_target"],
+        default="floor",
+        help=(
+            "Seidel RMS prior form. 'floor' uses max(0, alpha*target - recovered)^2; "
+            "'ratio_target' uses (recovered/target - alpha)^2."
+        ),
+    )
     parser.add_argument(
         "--seidel-rms-floor-weight",
         type=float,

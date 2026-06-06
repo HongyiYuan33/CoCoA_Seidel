@@ -561,6 +561,7 @@ def train_cocoa_like(
     fixed_seidel_indices: Sequence[int] | None,
     scheduler: str | None,
     eta_min_ratio: float,
+    seidel_rms_prior_mode: str,
     seidel_rms_floor_weight: float,
     seidel_rms_floor_alpha: float,
     seidel_rms_floor_target: float | None,
@@ -619,7 +620,7 @@ def train_cocoa_like(
     seidel_wavefront_rms_history: list[float] = []
     log_every = max(1, num_iter // 10)
 
-    rms_floor_enabled = (
+    rms_prior_enabled = (
         seidel_coeffs.requires_grad
         and seidel_model_dim is None
         and float(seidel_rms_floor_weight) > 0.0
@@ -627,13 +628,13 @@ def train_cocoa_like(
         and seidel_rms_floor_target is not None
         and float(seidel_rms_floor_target) > 0.0
     )
-    if float(seidel_rms_floor_weight) > 0.0 and not rms_floor_enabled and verbose:
+    if float(seidel_rms_floor_weight) > 0.0 and not rms_prior_enabled and verbose:
         print(
-            "[warn] Seidel RMS floor prior disabled because the current mode/model "
+            "[warn] Seidel RMS prior disabled because the current mode/model "
             "does not expose trainable backend-6 Seidel coefficients or target RMS.",
             flush=True,
         )
-    if rms_floor_enabled:
+    if rms_prior_enabled:
         pupil_x, pupil_rho2 = torch_pupil_grid(
             int(seidel_rms_floor_pupil_samples),
             device=measurement_gt.device,
@@ -646,13 +647,13 @@ def train_cocoa_like(
             device=measurement_gt.device,
             dtype=measurement_gt.dtype,
         )
-        floor_target = torch.as_tensor(
-            float(seidel_rms_floor_alpha) * float(seidel_rms_floor_target),
+        rms_target = torch.as_tensor(
+            float(seidel_rms_floor_target),
             device=measurement_gt.device,
             dtype=measurement_gt.dtype,
         )
     else:
-        pupil_x = pupil_rho2 = field_h = floor_target = None
+        pupil_x = pupil_rho2 = field_h = rms_target = None
 
     sharp = torch.zeros_like(measurement_gt)
     measurement_pred = torch.zeros_like(measurement_gt)
@@ -685,18 +686,27 @@ def train_cocoa_like(
         else:
             loss_anchor = torch.zeros_like(loss_ssim)
 
-        if rms_floor_enabled:
+        if rms_prior_enabled:
             assert pupil_x is not None
             assert pupil_rho2 is not None
             assert field_h is not None
-            assert floor_target is not None
+            assert rms_target is not None
             seidel_wavefront_rms = torch_field_weighted_wavefront_rms(
                 seidel_for_forward,
                 pupil_x=pupil_x,
                 pupil_rho2=pupil_rho2,
                 field_h=field_h,
             )
-            loss_rms_floor = torch.relu(floor_target - seidel_wavefront_rms).square()
+            if seidel_rms_prior_mode == "floor":
+                floor_target = float(seidel_rms_floor_alpha) * rms_target
+                loss_rms_floor = torch.relu(floor_target - seidel_wavefront_rms).square()
+            elif seidel_rms_prior_mode == "ratio_target":
+                recovered_over_target = seidel_wavefront_rms / rms_target.clamp_min(1e-12)
+                loss_rms_floor = (
+                    recovered_over_target - float(seidel_rms_floor_alpha)
+                ).square()
+            else:
+                raise ValueError(f"Unknown seidel_rms_prior_mode={seidel_rms_prior_mode!r}")
         else:
             seidel_wavefront_rms = torch.zeros_like(loss_ssim)
             loss_rms_floor = torch.zeros_like(loss_ssim)
@@ -843,6 +853,7 @@ def compute_metrics(
         "final_seidel_wavefront_rms_floor_estimate": float(
             result.seidel_wavefront_rms_history[-1]
         ),
+        "seidel_rms_prior_mode": str(args.seidel_rms_prior_mode),
         "seidel_rms_floor_weight": float(args.seidel_rms_floor_weight),
         "seidel_rms_floor_alpha": float(args.seidel_rms_floor_alpha),
         "seidel_rms_floor_target": (
@@ -1039,6 +1050,7 @@ def run_one_mode(
         f"mlp={args.nerf_depth}x{args.nerf_width} "
         f"skips={format_nerf_skips(args.nerf_skips)} "
         f"fourier={args.fourier_num_angles}x{args.fourier_num_octaves} "
+        f"rms_prior_mode={args.seidel_rms_prior_mode} "
         f"rms_floor_weight={args.seidel_rms_floor_weight:g} "
         f"rms_floor_alpha={args.seidel_rms_floor_alpha:g} "
         f"rms_floor_target={args.seidel_rms_floor_target}",
@@ -1074,6 +1086,7 @@ def run_one_mode(
         ),
         scheduler=args.scheduler,
         eta_min_ratio=args.eta_min_ratio,
+        seidel_rms_prior_mode=args.seidel_rms_prior_mode,
         seidel_rms_floor_weight=args.seidel_rms_floor_weight,
         seidel_rms_floor_alpha=args.seidel_rms_floor_alpha,
         seidel_rms_floor_target=args.seidel_rms_floor_target,
@@ -1134,6 +1147,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--pretrain-scalar", type=float, default=5.0)
     ap.add_argument("--defocus-anchor-weight", type=float, default=1.0)
     ap.add_argument("--defocus-index", type=int, default=5)
+    ap.add_argument(
+        "--seidel-rms-prior-mode",
+        choices=["floor", "ratio_target"],
+        default="floor",
+        help=(
+            "Seidel RMS prior form. 'floor' uses max(0, alpha*target - recovered)^2; "
+            "'ratio_target' uses (recovered/target - alpha)^2."
+        ),
+    )
     ap.add_argument(
         "--seidel-rms-floor-weight",
         type=float,

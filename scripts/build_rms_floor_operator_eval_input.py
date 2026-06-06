@@ -21,6 +21,7 @@ PREFERRED_FIELDS = [
     "image",
     "size",
     "seidel_convention",
+    "seidel_rms_prior_mode",
     "fixed_seidel_indices",
     "seidel_gt",
     "seidel_final",
@@ -76,6 +77,10 @@ def row_from_metrics(metrics_path: Path, output_root: Path) -> dict[str, Any]:
         "image": metrics.get("image"),
         "size": metrics.get("size"),
         "seidel_convention": metrics.get("seidel_convention", config.get("seidel_convention")),
+        "seidel_rms_prior_mode": metrics.get(
+            "seidel_rms_prior_mode",
+            config.get("seidel_rms_prior_mode", "floor"),
+        ),
         "fixed_seidel_indices": metrics.get("fixed_seidel_indices", config.get("fixed_seidel_indices", [])),
         "seidel_gt": metrics.get("seidel_gt"),
         "seidel_final": metrics.get("seidel_final"),

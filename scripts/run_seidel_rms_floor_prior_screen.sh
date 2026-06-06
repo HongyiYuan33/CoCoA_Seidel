@@ -20,6 +20,7 @@ STRENGTHS=(${STRENGTHS:-0.06 0.12 0.20})
 CONVENTIONS=(${CONVENTIONS:-classical4d classical5d classical6d})
 ALPHAS=(${ALPHAS:-0.8})
 WEIGHTS=(${WEIGHTS:-0 10 50})
+RMS_PRIOR_MODE="${RMS_PRIOR_MODE:-floor}"
 
 LR_OBJ="${LR_OBJ:-0.01}"
 LR_SEIDEL="${LR_SEIDEL:-0.0005}"
@@ -54,7 +55,7 @@ tag_value() {
 echo "[launcher] host=$(hostname) user=$(whoami) root=${PROJECT_ROOT}"
 echo "[launcher] run_prefix=${RUN_PREFIX} size=${SIZE} pretrain=${PRETRAIN_ITER} joint=${NUM_ITER}"
 echo "[launcher] images=${IMAGES[*]} directions=${DIRECTIONS[*]} strengths=${STRENGTHS[*]}"
-echo "[launcher] conventions=${CONVENTIONS[*]} alphas=${ALPHAS[*]} weights=${WEIGHTS[*]}"
+echo "[launcher] conventions=${CONVENTIONS[*]} alphas=${ALPHAS[*]} weights=${WEIGHTS[*]} rms_prior_mode=${RMS_PRIOR_MODE}"
 echo "[launcher] tuned params lr_obj=${LR_OBJ} lr_seidel=${LR_SEIDEL} rsd=${RSD_WEIGHT} max=${MAX_VAL} beta=${NERF_BETA}"
 if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-gpu=index,pci.bus_id,name,memory.used,memory.total,utilization.gpu --format=csv || true
@@ -92,6 +93,7 @@ for convention in "${CONVENTIONS[@]}"; do
         --nerf-skips "$NERF_SKIPS"
         --fourier-num-angles "$FOURIER_NUM_ANGLES"
         --fourier-num-octaves "$FOURIER_NUM_OCTAVES"
+        --seidel-rms-prior-mode "$RMS_PRIOR_MODE"
         --seidel-rms-floor-alpha "$alpha"
         --seidel-rms-floor-weight "$weight"
         --seidel-rms-floor-field-samples "$RMS_FLOOR_FIELD_SAMPLES"
