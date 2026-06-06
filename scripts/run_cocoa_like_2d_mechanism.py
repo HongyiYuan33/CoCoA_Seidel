@@ -90,6 +90,11 @@ SEIDEL_CONVENTIONS = (
     "classical6d",
     "backend6",
 )
+SEIDEL_PARAMETERIZATIONS = (
+    "direct",
+    "amp_direction",
+    "amp_direction_detach_norm",
+)
 
 
 def fixed_seidel_indices_for_convention(convention: str) -> list[int]:
@@ -416,6 +421,7 @@ class CocoaLikeObject2D(NeuralObject2D):
 class CocoaLikeResult(NamedTuple):
     sharp_final: torch.Tensor
     seidel_final: torch.Tensor
+    seidel_direction_raw_final: torch.Tensor
     measurement_pred: torch.Tensor
     loss_history: list[float]
     ssim_history: list[float]
@@ -424,6 +430,8 @@ class CocoaLikeResult(NamedTuple):
     anchor_history: list[float]
     seidel_rms_floor_history: list[float]
     seidel_wavefront_rms_history: list[float]
+    seidel_amplitude_history: list[float]
+    seidel_direction_rms_history: list[float]
     pretrain_history: list[float]
     elapsed_s: float
 
@@ -571,6 +579,7 @@ def train_cocoa_like(
     defocus_anchor_weight: float,
     defocus_index: int,
     seidel_model_dim: int | None,
+    seidel_parameterization: str,
     fixed_seidel_indices: Sequence[int] | None,
     fixed_seidel_values: Sequence[float] | torch.Tensor | None,
     seidel_lr_multipliers: Sequence[float] | torch.Tensor | None,
@@ -587,6 +596,22 @@ def train_cocoa_like(
 ) -> CocoaLikeResult:
     H, W = measurement_gt.shape
     resolved_sys = build_sys_params(H, sys_params)
+    if seidel_parameterization not in SEIDEL_PARAMETERIZATIONS:
+        raise ValueError(f"Unknown seidel_parameterization={seidel_parameterization!r}")
+    amp_direction_enabled = seidel_parameterization in {
+        "amp_direction",
+        "amp_direction_detach_norm",
+    }
+    if amp_direction_enabled:
+        if not seidel_coeffs.requires_grad or seidel_model_dim is not None:
+            raise ValueError("Amplitude-direction parameterization requires trainable backend-6 Seidel coefficients")
+        if int(seidel_coeffs.numel()) != 6:
+            raise ValueError("Amplitude-direction parameterization requires exactly 6 backend Seidel entries")
+        if fixed_seidel_indices:
+            raise ValueError("Amplitude-direction parameterization does not support fixed Seidel indices")
+        if seidel_lr_multipliers is not None:
+            raise ValueError("Amplitude-direction parameterization does not support Seidel LR multipliers")
+
     fixed = tuple(sorted({int(idx) for idx in (fixed_seidel_indices or [])}))
     fixed_mask: torch.Tensor | None = None
     fixed_values_tensor: torch.Tensor | None = None
@@ -626,8 +651,23 @@ def train_cocoa_like(
             )
 
     param_groups: list[dict] = [{"params": net_obj.parameters(), "lr": lr_obj}]
+    seidel_amplitude_param: nn.Parameter | None = None
+    if amp_direction_enabled:
+        amp_init = (
+            0.05 * float(seidel_rms_floor_target)
+            if seidel_rms_floor_target is not None and float(seidel_rms_floor_target) > 0.0
+            else 1e-3
+        )
+        amp_init_tensor = torch.as_tensor(
+            max(float(amp_init), 1e-8),
+            device=seidel_coeffs.device,
+            dtype=seidel_coeffs.dtype,
+        )
+        seidel_amplitude_param = nn.Parameter(amp_init_tensor.reshape(()))
     if seidel_coeffs.requires_grad:
         param_groups.append({"params": [seidel_coeffs], "lr": lr_seidel})
+    if seidel_amplitude_param is not None:
+        param_groups.append({"params": [seidel_amplitude_param], "lr": lr_seidel})
 
     optimizer = torch.optim.Adam(param_groups, betas=(0.9, 0.999), eps=1e-8)
     lr_scheduler = (
@@ -660,6 +700,8 @@ def train_cocoa_like(
     anchor_history: list[float] = []
     seidel_rms_floor_history: list[float] = []
     seidel_wavefront_rms_history: list[float] = []
+    seidel_amplitude_history: list[float] = []
+    seidel_direction_rms_history: list[float] = []
     log_every = max(1, num_iter // 10)
 
     rms_prior_enabled = (
@@ -676,7 +718,8 @@ def train_cocoa_like(
             "does not expose trainable backend-6 Seidel coefficients or target RMS.",
             flush=True,
         )
-    if rms_prior_enabled:
+    needs_rms_grid = rms_prior_enabled or amp_direction_enabled
+    if needs_rms_grid:
         pupil_x, pupil_rho2 = torch_pupil_grid(
             int(seidel_rms_floor_pupil_samples),
             device=measurement_gt.device,
@@ -689,21 +732,43 @@ def train_cocoa_like(
             device=measurement_gt.device,
             dtype=measurement_gt.dtype,
         )
-        rms_target = torch.as_tensor(
-            float(seidel_rms_floor_target),
-            device=measurement_gt.device,
-            dtype=measurement_gt.dtype,
+        rms_target = (
+            torch.as_tensor(
+                float(seidel_rms_floor_target),
+                device=measurement_gt.device,
+                dtype=measurement_gt.dtype,
+            )
+            if seidel_rms_floor_target is not None and float(seidel_rms_floor_target) > 0.0
+            else None
         )
     else:
         pupil_x = pupil_rho2 = field_h = rms_target = None
 
     sharp = torch.zeros_like(measurement_gt)
     measurement_pred = torch.zeros_like(measurement_gt)
+    seidel_for_forward = seidel_coeffs.detach()
+    direction_rms = torch.zeros((), device=measurement_gt.device, dtype=measurement_gt.dtype)
+    seidel_amplitude = torch.zeros((), device=measurement_gt.device, dtype=measurement_gt.dtype)
     t0 = time.time()
 
     for step in range(num_iter):
         sharp = net_obj.render(H, W)
-        if fixed_mask is not None:
+        if amp_direction_enabled:
+            assert pupil_x is not None
+            assert pupil_rho2 is not None
+            assert field_h is not None
+            assert seidel_amplitude_param is not None
+            direction_rms = torch_field_weighted_wavefront_rms(
+                seidel_coeffs,
+                pupil_x=pupil_x,
+                pupil_rho2=pupil_rho2,
+                field_h=field_h,
+            )
+            denom = direction_rms.detach() if seidel_parameterization == "amp_direction_detach_norm" else direction_rms
+            direction_unit = seidel_coeffs / denom.clamp_min(1e-12)
+            seidel_amplitude = torch.sqrt(seidel_amplitude_param.square().clamp_min(1e-24))
+            seidel_for_forward = seidel_amplitude * direction_unit
+        elif fixed_mask is not None:
             assert fixed_values_tensor is not None
             seidel_for_forward = seidel_coeffs * fixed_mask + fixed_values_tensor * (1.0 - fixed_mask)
         else:
@@ -728,33 +793,37 @@ def train_cocoa_like(
             and seidel_model_dim is None
             and int(defocus_index) not in fixed
         ):
-            loss_anchor = single_mode_control(seidel_coeffs, defocus_index, 0.0, 0.0)
+            loss_anchor = single_mode_control(seidel_for_forward, defocus_index, 0.0, 0.0)
         else:
             loss_anchor = torch.zeros_like(loss_ssim)
 
-        if rms_prior_enabled:
+        if needs_rms_grid:
             assert pupil_x is not None
             assert pupil_rho2 is not None
             assert field_h is not None
-            assert rms_target is not None
             seidel_wavefront_rms = torch_field_weighted_wavefront_rms(
                 seidel_for_forward,
                 pupil_x=pupil_x,
                 pupil_rho2=pupil_rho2,
                 field_h=field_h,
             )
+        else:
+            seidel_wavefront_rms = torch.zeros_like(loss_ssim)
+
+        if rms_prior_enabled:
+            assert rms_target is not None
+            rms_control_value = seidel_amplitude if amp_direction_enabled else seidel_wavefront_rms
             if seidel_rms_prior_mode == "floor":
                 floor_target = float(seidel_rms_floor_alpha) * rms_target
-                loss_rms_floor = torch.relu(floor_target - seidel_wavefront_rms).square()
+                loss_rms_floor = torch.relu(floor_target - rms_control_value).square()
             elif seidel_rms_prior_mode == "ratio_target":
-                recovered_over_target = seidel_wavefront_rms / rms_target.clamp_min(1e-12)
+                recovered_over_target = rms_control_value / rms_target.clamp_min(1e-12)
                 loss_rms_floor = (
                     recovered_over_target - float(seidel_rms_floor_alpha)
                 ).square()
             else:
                 raise ValueError(f"Unknown seidel_rms_prior_mode={seidel_rms_prior_mode!r}")
         else:
-            seidel_wavefront_rms = torch.zeros_like(loss_ssim)
             loss_rms_floor = torch.zeros_like(loss_ssim)
 
         loss = (
@@ -784,23 +853,63 @@ def train_cocoa_like(
         anchor_history.append(float(loss_anchor.item()))
         seidel_rms_floor_history.append(float(loss_rms_floor.item()))
         seidel_wavefront_rms_history.append(float(seidel_wavefront_rms.item()))
+        if amp_direction_enabled:
+            seidel_amplitude_history.append(float(seidel_amplitude.item()))
+            seidel_direction_rms_history.append(float(direction_rms.item()))
 
         if verbose and (step % log_every == 0 or step == num_iter - 1):
-            coeffs = ", ".join(f"{x:.4f}" for x in seidel_coeffs.detach().cpu())
+            coeffs = ", ".join(f"{x:.4f}" for x in seidel_for_forward.detach().cpu())
             print(
                 f"[{mode} train {step:04d}] total={loss.item():.6f} "
                 f"ssim={loss_ssim.item():.6f} rsd={loss_rsd.item():.6f} "
                 f"tv={loss_tv.item():.6f} anchor={loss_anchor.item():.6f} "
                 f"rms_floor={loss_rms_floor.item():.6f} "
                 f"wf_rms={seidel_wavefront_rms.item():.6f} "
+                f"amp={seidel_amplitude.item():.6f} "
+                f"dir_rms={direction_rms.item():.6f} "
                 f"seidel=[{coeffs}]",
                 flush=True,
             )
 
+    with torch.no_grad():
+        if amp_direction_enabled:
+            assert pupil_x is not None
+            assert pupil_rho2 is not None
+            assert field_h is not None
+            assert seidel_amplitude_param is not None
+            final_direction_rms = torch_field_weighted_wavefront_rms(
+                seidel_coeffs,
+                pupil_x=pupil_x,
+                pupil_rho2=pupil_rho2,
+                field_h=field_h,
+            )
+            final_denom = final_direction_rms
+            final_direction_unit = seidel_coeffs / final_denom.clamp_min(1e-12)
+            final_amplitude = torch.sqrt(seidel_amplitude_param.square().clamp_min(1e-24))
+            final_seidel = final_amplitude * final_direction_unit
+            final_wavefront_rms = torch_field_weighted_wavefront_rms(
+                final_seidel,
+                pupil_x=pupil_x,
+                pupil_rho2=pupil_rho2,
+                field_h=field_h,
+            )
+            if seidel_amplitude_history:
+                seidel_amplitude_history[-1] = float(final_amplitude.item())
+            if seidel_direction_rms_history:
+                seidel_direction_rms_history[-1] = float(final_direction_rms.item())
+            if seidel_wavefront_rms_history:
+                seidel_wavefront_rms_history[-1] = float(final_wavefront_rms.item())
+        elif fixed_mask is not None:
+            assert fixed_values_tensor is not None
+            final_seidel = seidel_coeffs * fixed_mask + fixed_values_tensor * (1.0 - fixed_mask)
+        else:
+            final_seidel = seidel_coeffs
+
     elapsed = time.time() - t0
     return CocoaLikeResult(
         sharp_final=sharp.detach(),
-        seidel_final=seidel_coeffs.detach().clone(),
+        seidel_final=final_seidel.detach().clone(),
+        seidel_direction_raw_final=seidel_coeffs.detach().clone(),
         measurement_pred=measurement_pred.detach(),
         loss_history=loss_history,
         ssim_history=ssim_history,
@@ -809,6 +918,8 @@ def train_cocoa_like(
         anchor_history=anchor_history,
         seidel_rms_floor_history=seidel_rms_floor_history,
         seidel_wavefront_rms_history=seidel_wavefront_rms_history,
+        seidel_amplitude_history=seidel_amplitude_history,
+        seidel_direction_rms_history=seidel_direction_rms_history,
         pretrain_history=pretrain_history,
         elapsed_s=elapsed,
     )
@@ -865,6 +976,15 @@ def summarize_array(prefix: str, arr: np.ndarray) -> dict[str, float]:
     }
 
 
+def finite_history_final(values: Sequence[float]) -> float | None:
+    if not values:
+        return None
+    value = float(values[-1])
+    if not np.isfinite(value):
+        return None
+    return value
+
+
 def compute_metrics(
     sharp_gt: torch.Tensor,
     meas_gt: torch.Tensor,
@@ -883,6 +1003,7 @@ def compute_metrics(
     sr_gain_t = torch.as_tensor(sr_gain, dtype=sharp_gt.dtype, device=sharp_gt.device)
 
     seidel_final = result.seidel_final.detach().cpu().numpy()
+    seidel_direction_raw_final = result.seidel_direction_raw_final.detach().cpu().numpy()
     metrics = {
         "mode": mode,
         "image": args.image,
@@ -905,6 +1026,10 @@ def compute_metrics(
         "seidel_rms_prior_mode": str(args.seidel_rms_prior_mode),
         "seidel_rms_floor_weight": float(args.seidel_rms_floor_weight),
         "seidel_rms_floor_alpha": float(args.seidel_rms_floor_alpha),
+        "seidel_parameterization": str(getattr(args, "seidel_parameterization", "direct")),
+        "seidel_amplitude_final": finite_history_final(result.seidel_amplitude_history),
+        "seidel_direction_rms_final": finite_history_final(result.seidel_direction_rms_history),
+        "seidel_direction_raw_final": seidel_direction_raw_final.tolist(),
         "seidel_rms_floor_target": (
             None if args.seidel_rms_floor_target is None else float(args.seidel_rms_floor_target)
         ),
@@ -1077,6 +1202,7 @@ def run_one_mode(
 ) -> tuple[CocoaLikeResult, dict]:
     out_dir = root_dir / mode
     out_dir.mkdir(parents=True, exist_ok=True)
+    seidel_parameterization = str(getattr(args, "seidel_parameterization", "direct"))
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -1096,7 +1222,10 @@ def run_one_mode(
         seidel.requires_grad_(False)
     elif mode == "joint":
         dim = int(trace_model_dim(args.seidel_convention) or 6)
-        seidel = nn.Parameter(torch.zeros(dim, device=device, dtype=sharp_gt.dtype))
+        if seidel_parameterization in {"amp_direction", "amp_direction_detach_norm"}:
+            seidel = nn.Parameter(torch.randn(dim, device=device, dtype=sharp_gt.dtype))
+        else:
+            seidel = nn.Parameter(torch.zeros(dim, device=device, dtype=sharp_gt.dtype))
     else:
         raise ValueError(f"Unknown mode={mode!r}")
 
@@ -1110,6 +1239,7 @@ def run_one_mode(
         f"rms_floor_weight={args.seidel_rms_floor_weight:g} "
         f"rms_floor_alpha={args.seidel_rms_floor_alpha:g} "
         f"rms_floor_target={args.seidel_rms_floor_target} "
+        f"seidel_parameterization={seidel_parameterization} "
         f"seidel_lr_multipliers={args.seidel_lr_multipliers}",
         flush=True,
     )
@@ -1155,6 +1285,7 @@ def run_one_mode(
         defocus_anchor_weight=args.defocus_anchor_weight,
         defocus_index=args.defocus_index,
         seidel_model_dim=trace_model_dim(args.seidel_convention),
+        seidel_parameterization=seidel_parameterization,
         fixed_seidel_indices=fixed_seidel_indices,
         fixed_seidel_values=fixed_seidel_values,
         seidel_lr_multipliers=args.seidel_lr_multipliers,
@@ -1180,6 +1311,7 @@ def run_one_mode(
             "sharp_recon": result.sharp_final.detach().cpu(),
             "measurement_pred": result.measurement_pred.detach().cpu(),
             "seidel_final": result.seidel_final.detach().cpu(),
+            "seidel_direction_raw_final": result.seidel_direction_raw_final.detach().cpu(),
             "loss_history": result.loss_history,
             "ssim_history": result.ssim_history,
             "rsd_history": result.rsd_history,
@@ -1187,6 +1319,8 @@ def run_one_mode(
             "anchor_history": result.anchor_history,
             "seidel_rms_floor_history": result.seidel_rms_floor_history,
             "seidel_wavefront_rms_history": result.seidel_wavefront_rms_history,
+            "seidel_amplitude_history": result.seidel_amplitude_history,
+            "seidel_direction_rms_history": result.seidel_direction_rms_history,
             "pretrain_history": result.pretrain_history,
         },
         out_dir / "tensors.pt",
@@ -1230,6 +1364,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--pretrain-scalar", type=float, default=5.0)
     ap.add_argument("--defocus-anchor-weight", type=float, default=1.0)
     ap.add_argument("--defocus-index", type=int, default=5)
+    ap.add_argument(
+        "--seidel-parameterization",
+        choices=SEIDEL_PARAMETERIZATIONS,
+        default="direct",
+        help=(
+            "Internal Seidel optimization parameterization. 'direct' trains "
+            "backend coefficients directly; amp_direction trains theta=a*u "
+            "with unit wavefront-RMS direction u; amp_direction_detach_norm "
+            "detaches the direction RMS denominator."
+        ),
+    )
     ap.add_argument(
         "--seidel-rms-prior-mode",
         choices=["floor", "ratio_target"],
@@ -1349,6 +1494,13 @@ def main() -> None:
             raise ValueError("--seidel-lr-multipliers-json values must be non-negative")
     else:
         args.seidel_lr_multipliers = None
+    if args.seidel_parameterization != "direct":
+        if args.seidel_convention not in {"classical6d", "backend6"}:
+            raise ValueError("--seidel-parameterization amp_direction* requires classical6d/backend6")
+        if args.gt_fixed_seidel_indices:
+            raise ValueError("--seidel-parameterization amp_direction* does not support --gt-fixed-seidel-indices")
+        if args.seidel_lr_multipliers is not None:
+            raise ValueError("--seidel-parameterization amp_direction* does not support --seidel-lr-multipliers-json")
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if args.gt_seidel_json is not None:

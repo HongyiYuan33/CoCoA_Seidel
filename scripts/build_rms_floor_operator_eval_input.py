@@ -22,6 +22,9 @@ PREFERRED_FIELDS = [
     "size",
     "seidel_convention",
     "seidel_rms_prior_mode",
+    "seidel_parameterization",
+    "seidel_amplitude_final",
+    "seidel_direction_rms_final",
     "fixed_seidel_indices",
     "gt_fixed_seidel_indices",
     "gt_fixed_seidel_values",
@@ -84,6 +87,12 @@ def row_from_metrics(metrics_path: Path, output_root: Path) -> dict[str, Any]:
             "seidel_rms_prior_mode",
             config.get("seidel_rms_prior_mode", "floor"),
         ),
+        "seidel_parameterization": metrics.get(
+            "seidel_parameterization",
+            config.get("seidel_parameterization", "direct"),
+        ),
+        "seidel_amplitude_final": metrics.get("seidel_amplitude_final"),
+        "seidel_direction_rms_final": metrics.get("seidel_direction_rms_final"),
         "fixed_seidel_indices": metrics.get("fixed_seidel_indices", config.get("fixed_seidel_indices", [])),
         "gt_fixed_seidel_indices": metrics.get(
             "gt_fixed_seidel_indices",

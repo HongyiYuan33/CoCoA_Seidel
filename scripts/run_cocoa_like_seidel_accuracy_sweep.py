@@ -189,6 +189,7 @@ def run_args_for_case(
         pretrain_scalar=sweep_args.pretrain_scalar,
         defocus_anchor_weight=sweep_args.defocus_anchor_weight,
         defocus_index=sweep_args.defocus_index,
+        seidel_parameterization=sweep_args.seidel_parameterization,
         seidel_rms_prior_mode=sweep_args.seidel_rms_prior_mode,
         seidel_rms_floor_weight=sweep_args.seidel_rms_floor_weight,
         seidel_rms_floor_alpha=sweep_args.seidel_rms_floor_alpha,
@@ -263,6 +264,9 @@ def augment_metrics(
             "seidel_rms_floor_weight": float(config.get("seidel_rms_floor_weight", 0.0)),
             "seidel_rms_floor_alpha": float(config.get("seidel_rms_floor_alpha", 0.8)),
             "seidel_rms_floor_target": config.get("seidel_rms_floor_target"),
+            "seidel_parameterization": str(config.get("seidel_parameterization", "direct")),
+            "seidel_amplitude_final": metrics.get("seidel_amplitude_final"),
+            "seidel_direction_rms_final": metrics.get("seidel_direction_rms_final"),
             "gt_fixed_seidel_indices": list(config.get("gt_fixed_seidel_indices", [])),
             "gt_fixed_seidel_values": [
                 float(gt[int(idx)]) for idx in config.get("gt_fixed_seidel_indices", [])
@@ -398,6 +402,9 @@ def write_csv(rows: list[dict], path: Path) -> None:
         "seidel_rms_floor_weight",
         "seidel_rms_floor_alpha",
         "seidel_rms_floor_target",
+        "seidel_parameterization",
+        "seidel_amplitude_final",
+        "seidel_direction_rms_final",
         "gt_fixed_seidel_indices",
         "gt_fixed_seidel_values",
         "seidel_lr_multipliers",
@@ -799,6 +806,8 @@ def run_stage1_case_subprocess(
         str(args.defocus_anchor_weight),
         "--defocus-index",
         str(args.defocus_index),
+        "--seidel-parameterization",
+        args.seidel_parameterization,
         "--scheduler",
         args.scheduler or "none",
         "--eta-min-ratio",
@@ -984,6 +993,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrain-scalar", type=float, default=5.0)
     parser.add_argument("--defocus-anchor-weight", type=float, default=1.0)
     parser.add_argument("--defocus-index", type=int, default=5)
+    parser.add_argument(
+        "--seidel-parameterization",
+        choices=cocoa.SEIDEL_PARAMETERIZATIONS,
+        default="direct",
+        help=(
+            "Internal Seidel optimization parameterization. 'direct' preserves "
+            "the historical coefficient training; amp_direction variants train "
+            "theta=a*u with unit wavefront-RMS direction u."
+        ),
+    )
     parser.add_argument("--scheduler", choices=["cosine", "none"], default="cosine")
     parser.add_argument("--eta-min-ratio", type=float, default=1.0 / 25.0)
     parser.add_argument("--max-val", type=float, default=40.0)
@@ -1057,6 +1076,13 @@ def parse_args() -> argparse.Namespace:
     invalid_gt_fixed = [idx for idx in args.gt_fixed_seidel_indices if idx < 0 or idx >= 6]
     if invalid_gt_fixed:
         raise ValueError(f"--gt-fixed-seidel-indices out of backend-6 range: {invalid_gt_fixed}")
+    if args.seidel_parameterization != "direct":
+        if args.seidel_convention not in {"classical6d", "backend6"}:
+            raise ValueError("--seidel-parameterization amp_direction* requires classical6d/backend6")
+        if args.gt_fixed_seidel_indices:
+            raise ValueError("--seidel-parameterization amp_direction* does not support --gt-fixed-seidel-indices")
+        if args.seidel_lr_multipliers is not None:
+            raise ValueError("--seidel-parameterization amp_direction* does not support --seidel-lr-multipliers-json")
     if args.seidel_rms_floor_weight < 0.0:
         raise ValueError("--seidel-rms-floor-weight must be non-negative")
     if args.seidel_rms_floor_alpha < 0.0:

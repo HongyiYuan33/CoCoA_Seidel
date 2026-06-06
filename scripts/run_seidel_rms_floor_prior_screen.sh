@@ -18,6 +18,7 @@ IMAGES=(${IMAGES:-Iksung_beads dendrites})
 DIRECTIONS=(${DIRECTIONS:-cocoa_signed signed_balanced astig_field coma_dominant})
 STRENGTHS=(${STRENGTHS:-0.06 0.12 0.20})
 CONVENTIONS=(${CONVENTIONS:-classical4d classical5d classical6d})
+SEIDEL_PARAMETERIZATIONS=(${SEIDEL_PARAMETERIZATIONS:-direct})
 ALPHAS=(${ALPHAS:-0.8})
 WEIGHTS=(${WEIGHTS:-0 10 50})
 RMS_PRIOR_MODE="${RMS_PRIOR_MODE:-floor}"
@@ -58,6 +59,7 @@ echo "[launcher] host=$(hostname) user=$(whoami) root=${PROJECT_ROOT}"
 echo "[launcher] run_prefix=${RUN_PREFIX} size=${SIZE} pretrain=${PRETRAIN_ITER} joint=${NUM_ITER}"
 echo "[launcher] images=${IMAGES[*]} directions=${DIRECTIONS[*]} strengths=${STRENGTHS[*]}"
 echo "[launcher] conventions=${CONVENTIONS[*]} alphas=${ALPHAS[*]} weights=${WEIGHTS[*]} rms_prior_mode=${RMS_PRIOR_MODE}"
+echo "[launcher] seidel_parameterizations=${SEIDEL_PARAMETERIZATIONS[*]}"
 echo "[launcher] tuned params lr_obj=${LR_OBJ} lr_seidel=${LR_SEIDEL} rsd=${RSD_WEIGHT} max=${MAX_VAL} beta=${NERF_BETA}"
 echo "[launcher] gt_fixed_seidel_indices=${GT_FIXED_SEIDEL_INDICES[*]:-none}"
 echo "[launcher] seidel_lr_multipliers_json=${SEIDEL_LR_MULTIPLIERS_JSON:-none}"
@@ -67,63 +69,69 @@ fi
 
 cd "$PROJECT_ROOT"
 
-for convention in "${CONVENTIONS[@]}"; do
-  for alpha in "${ALPHAS[@]}"; do
-    for weight in "${WEIGHTS[@]}"; do
-      alpha_tag="$(tag_value "$alpha")"
-      weight_tag="$(tag_value "$weight")"
-      run_name="${RUN_PREFIX}_${convention}_alpha${alpha_tag}_lambda${weight_tag}"
-      cmd=(
-        "$PYTHON_BIN" "${SCRIPT_DIR}/run_cocoa_like_seidel_accuracy_sweep.py"
-        --run-name "$run_name"
-        --stage stage1
-        --images "${IMAGES[@]}"
-        --directions "${DIRECTIONS[@]}"
-        --strengths "${STRENGTHS[@]}"
-        --seidel-convention "$convention"
-        --stage1-size "$SIZE"
-        --stage1-pretrain-iter "$PRETRAIN_ITER"
-        --stage1-num-iter "$NUM_ITER"
-        --lr-obj "$LR_OBJ"
-        --lr-seidel "$LR_SEIDEL"
-        --rsd-weight "$RSD_WEIGHT"
-        --tv-weight "$TV_WEIGHT"
-        --pretrain-scalar "$PRETRAIN_SCALAR"
-        --defocus-anchor-weight "$DEFOCUS_ANCHOR_WEIGHT"
-        --max-val "$MAX_VAL"
-        --nerf-beta "$NERF_BETA"
-        --nerf-depth "$NERF_DEPTH"
-        --nerf-width "$NERF_WIDTH"
-        --nerf-skips "$NERF_SKIPS"
-        --fourier-num-angles "$FOURIER_NUM_ANGLES"
-        --fourier-num-octaves "$FOURIER_NUM_OCTAVES"
-        --seidel-rms-prior-mode "$RMS_PRIOR_MODE"
-        --seidel-rms-floor-alpha "$alpha"
-        --seidel-rms-floor-weight "$weight"
-        --seidel-rms-floor-field-samples "$RMS_FLOOR_FIELD_SAMPLES"
-        --seidel-rms-floor-pupil-samples "$RMS_FLOOR_PUPIL_SAMPLES"
-        --num-shards "$NUM_SHARDS"
-        --shard-index "$SHARD_INDEX"
-      )
-      if [[ ${#GT_FIXED_SEIDEL_INDICES[@]} -gt 0 ]]; then
-        cmd+=(--gt-fixed-seidel-indices "${GT_FIXED_SEIDEL_INDICES[@]}")
-      fi
-      if [[ -n "$SEIDEL_LR_MULTIPLIERS_JSON" ]]; then
-        cmd+=(--seidel-lr-multipliers-json "$SEIDEL_LR_MULTIPLIERS_JSON")
-      fi
-      if [[ "$CASE_SUBPROCESS" == "1" ]]; then
-        cmd+=(--case-subprocess)
-      fi
-      if [[ "$SKIP_REPORT" == "1" ]]; then
-        cmd+=(--skip-report)
-      fi
-      echo "[run] ${run_name}"
-      if [[ "$DRY_RUN" == "1" ]]; then
-        printf ' %q' "${cmd[@]}"
-        printf '\n'
-      else
-        "${cmd[@]}"
-      fi
+for parameterization in "${SEIDEL_PARAMETERIZATIONS[@]}"; do
+  for convention in "${CONVENTIONS[@]}"; do
+    for alpha in "${ALPHAS[@]}"; do
+      for weight in "${WEIGHTS[@]}"; do
+        alpha_tag="$(tag_value "$alpha")"
+        weight_tag="$(tag_value "$weight")"
+        run_name="${RUN_PREFIX}_${convention}_alpha${alpha_tag}_lambda${weight_tag}"
+        if [[ "$parameterization" != "direct" ]]; then
+          run_name="${RUN_PREFIX}_${parameterization}_${convention}_alpha${alpha_tag}_lambda${weight_tag}"
+        fi
+        cmd=(
+          "$PYTHON_BIN" "${SCRIPT_DIR}/run_cocoa_like_seidel_accuracy_sweep.py"
+          --run-name "$run_name"
+          --stage stage1
+          --images "${IMAGES[@]}"
+          --directions "${DIRECTIONS[@]}"
+          --strengths "${STRENGTHS[@]}"
+          --seidel-convention "$convention"
+          --stage1-size "$SIZE"
+          --stage1-pretrain-iter "$PRETRAIN_ITER"
+          --stage1-num-iter "$NUM_ITER"
+          --lr-obj "$LR_OBJ"
+          --lr-seidel "$LR_SEIDEL"
+          --rsd-weight "$RSD_WEIGHT"
+          --tv-weight "$TV_WEIGHT"
+          --pretrain-scalar "$PRETRAIN_SCALAR"
+          --defocus-anchor-weight "$DEFOCUS_ANCHOR_WEIGHT"
+          --seidel-parameterization "$parameterization"
+          --max-val "$MAX_VAL"
+          --nerf-beta "$NERF_BETA"
+          --nerf-depth "$NERF_DEPTH"
+          --nerf-width "$NERF_WIDTH"
+          --nerf-skips "$NERF_SKIPS"
+          --fourier-num-angles "$FOURIER_NUM_ANGLES"
+          --fourier-num-octaves "$FOURIER_NUM_OCTAVES"
+          --seidel-rms-prior-mode "$RMS_PRIOR_MODE"
+          --seidel-rms-floor-alpha "$alpha"
+          --seidel-rms-floor-weight "$weight"
+          --seidel-rms-floor-field-samples "$RMS_FLOOR_FIELD_SAMPLES"
+          --seidel-rms-floor-pupil-samples "$RMS_FLOOR_PUPIL_SAMPLES"
+          --num-shards "$NUM_SHARDS"
+          --shard-index "$SHARD_INDEX"
+        )
+        if [[ ${#GT_FIXED_SEIDEL_INDICES[@]} -gt 0 ]]; then
+          cmd+=(--gt-fixed-seidel-indices "${GT_FIXED_SEIDEL_INDICES[@]}")
+        fi
+        if [[ -n "$SEIDEL_LR_MULTIPLIERS_JSON" ]]; then
+          cmd+=(--seidel-lr-multipliers-json "$SEIDEL_LR_MULTIPLIERS_JSON")
+        fi
+        if [[ "$CASE_SUBPROCESS" == "1" ]]; then
+          cmd+=(--case-subprocess)
+        fi
+        if [[ "$SKIP_REPORT" == "1" ]]; then
+          cmd+=(--skip-report)
+        fi
+        echo "[run] ${run_name}"
+        if [[ "$DRY_RUN" == "1" ]]; then
+          printf ' %q' "${cmd[@]}"
+          printf '\n'
+        else
+          "${cmd[@]}"
+        fi
+      done
     done
   done
 done
