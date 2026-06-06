@@ -303,6 +303,7 @@ def make_pair_panel(
     out_path: Path,
     top_label: str,
     bottom_label: str,
+    title_prefix: str,
 ) -> dict[str, Any]:
     cases = [top, bottom]
     ranges = collect_display_ranges(cases)
@@ -324,10 +325,7 @@ def make_pair_panel(
         wspace=0.045,
         hspace=0.22,
     )
-    title = (
-        f"Controlled RCP comparison: lambda=0 vs lambda=10000 | "
-        f"{row['image']} | {row['direction']} | 6D | GT RMS {target:.2f}"
-    )
+    title = f"{title_prefix} | {row['image']} | {row['direction']} | 6D | GT RMS {target:.2f}"
     fig.suptitle(title, fontsize=16, fontweight="bold", y=0.978)
 
     draw_image_panel(fig, outer[0, 0], top, ranges)
@@ -423,16 +421,16 @@ def write_manifest(rows: list[dict[str, Any]], out_dir: Path) -> None:
         writer.writerows(rows)
 
 
-def write_readme(rows: list[dict[str, Any]], out_dir: Path, csv_path: Path) -> None:
+def write_readme(rows: list[dict[str, Any]], out_dir: Path, csv_path: Path, args: argparse.Namespace) -> None:
     lines = [
-        "# Lambda 0 vs 10000 controlled RCP pairs",
+        f"# {args.title_prefix}",
         "",
         f"Input evaluator CSV: `{csv_path}`",
         "",
         "Folder layout:",
-        "- `rms*/<image>/lambda0_vs_lambda10000__<image>__<direction>__<rms>__RCP_vertical.png`",
-        "- top row: lambda=0",
-        "- bottom row: lambda=10000",
+        f"- `rms*/<image>/{args.file_prefix}__<image>__<direction>__<rms>__RCP_vertical.png`",
+        f"- top row: {args.top_label}",
+        f"- bottom row: {args.bottom_label}",
         "",
         "The paired rows use shared image display ranges and shared Seidel coefficient y-limits.",
         "The left image panels are GT, measurement, joint recon, predicted measurement, and gain abs error.",
@@ -457,6 +455,10 @@ def main() -> None:
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--top-lambda", type=float, default=0.0)
     parser.add_argument("--bottom-lambda", type=float, default=10000.0)
+    parser.add_argument("--top-label", default="lambda=0")
+    parser.add_argument("--bottom-label", default="lambda=10000")
+    parser.add_argument("--title-prefix", default="Controlled RCP comparison: lambda=0 vs lambda=10000")
+    parser.add_argument("--file-prefix", default="lambda0_vs_lambda10000")
     parser.add_argument("--no-contact-sheets", action="store_true")
     args = parser.parse_args()
 
@@ -488,20 +490,21 @@ def main() -> None:
             args.out_dir
             / label
             / safe_name(image)
-            / f"lambda0_vs_lambda10000__{safe_name(image)}__{safe_name(direction)}__{label}__RCP_vertical.png"
+            / f"{safe_name(args.file_prefix)}__{safe_name(image)}__{safe_name(direction)}__{label}__RCP_vertical.png"
         )
         manifest_rows.append(
             make_pair_panel(
                 top=top_case,
                 bottom=bottom_case,
                 out_path=out_path,
-                top_label="lambda=0",
-                bottom_label="lambda=10000",
+                top_label=args.top_label,
+                bottom_label=args.bottom_label,
+                title_prefix=args.title_prefix,
             )
         )
 
     write_manifest(manifest_rows, args.out_dir)
-    write_readme(manifest_rows, args.out_dir, args.csv)
+    write_readme(manifest_rows, args.out_dir, args.csv, args)
     if not args.no_contact_sheets:
         make_contact_sheets(manifest_rows, args.out_dir)
     if missing:

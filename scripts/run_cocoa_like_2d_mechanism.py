@@ -559,6 +559,7 @@ def train_cocoa_like(
     defocus_index: int,
     seidel_model_dim: int | None,
     fixed_seidel_indices: Sequence[int] | None,
+    fixed_seidel_values: Sequence[float] | torch.Tensor | None,
     scheduler: str | None,
     eta_min_ratio: float,
     seidel_rms_prior_mode: str,
@@ -574,14 +575,28 @@ def train_cocoa_like(
     resolved_sys = build_sys_params(H, sys_params)
     fixed = tuple(sorted({int(idx) for idx in (fixed_seidel_indices or [])}))
     fixed_mask: torch.Tensor | None = None
+    fixed_values_tensor: torch.Tensor | None = None
     if fixed:
         bad = [idx for idx in fixed if idx < 0 or idx >= int(seidel_coeffs.numel())]
         if bad:
             raise ValueError(f"fixed_seidel_indices out of range for parameter length {seidel_coeffs.numel()}: {bad}")
+        if fixed_seidel_values is None:
+            fixed_values_tensor = torch.zeros_like(seidel_coeffs)
+        else:
+            fixed_values_tensor = torch.as_tensor(
+                fixed_seidel_values,
+                device=seidel_coeffs.device,
+                dtype=seidel_coeffs.dtype,
+            ).reshape(-1)
+            if int(fixed_values_tensor.numel()) != int(seidel_coeffs.numel()):
+                raise ValueError(
+                    "fixed_seidel_values must match parameter length "
+                    f"{seidel_coeffs.numel()}, got {fixed_values_tensor.numel()}"
+                )
         fixed_mask = torch.ones_like(seidel_coeffs)
         fixed_mask[list(fixed)] = 0.0
         with torch.no_grad():
-            seidel_coeffs[list(fixed)] = 0.0
+            seidel_coeffs[list(fixed)] = fixed_values_tensor[list(fixed)]
 
     param_groups: list[dict] = [{"params": net_obj.parameters(), "lr": lr_obj}]
     if seidel_coeffs.requires_grad:
@@ -661,7 +676,11 @@ def train_cocoa_like(
 
     for step in range(num_iter):
         sharp = net_obj.render(H, W)
-        seidel_for_forward = seidel_coeffs * fixed_mask if fixed_mask is not None else seidel_coeffs
+        if fixed_mask is not None:
+            assert fixed_values_tensor is not None
+            seidel_for_forward = seidel_coeffs * fixed_mask + fixed_values_tensor * (1.0 - fixed_mask)
+        else:
+            seidel_for_forward = seidel_coeffs
         if psfs_cached is not None:
             measurement_pred = blur_ring_with_psfs(sharp, psfs_cached)
         elif seidel_model_dim is not None:
@@ -723,8 +742,9 @@ def train_cocoa_like(
         loss.backward()
         optimizer.step()
         if fixed and seidel_coeffs.requires_grad:
+            assert fixed_values_tensor is not None
             with torch.no_grad():
-                seidel_coeffs[list(fixed)] = 0.0
+                seidel_coeffs[list(fixed)] = fixed_values_tensor[list(fixed)]
         if lr_scheduler is not None:
             lr_scheduler.step()
 
@@ -861,6 +881,10 @@ def compute_metrics(
         ),
         "seidel_rms_floor_field_samples": int(args.seidel_rms_floor_field_samples),
         "seidel_rms_floor_pupil_samples": int(args.seidel_rms_floor_pupil_samples),
+        "gt_fixed_seidel_indices": list(getattr(args, "gt_fixed_seidel_indices", [])),
+        "gt_fixed_seidel_values": [
+            float(gt_seidel[idx]) for idx in getattr(args, "gt_fixed_seidel_indices", [])
+        ],
         "best_gain_recon_to_gt": gain,
         "nrmse_recon_raw_vs_gt": compute_nrmse(sgt, sr),
         "nrmse_recon_gain_vs_gt": compute_nrmse(sgt, sr_gain),
@@ -1065,6 +1089,25 @@ def run_one_mode(
         measurement_scalar=args.pretrain_scalar,
         verbose=args.verbose,
     )
+    convention_fixed = (
+        fixed_seidel_indices_for_convention(args.seidel_convention)
+        if trace_model_dim(args.seidel_convention) is None
+        else []
+    )
+    gt_fixed = sorted({int(idx) for idx in getattr(args, "gt_fixed_seidel_indices", [])})
+    fixed_seidel_indices = sorted(set(convention_fixed + gt_fixed))
+    fixed_seidel_values = None
+    if fixed_seidel_indices:
+        fixed_seidel_values = torch.zeros_like(seidel)
+        if gt_fixed:
+            if trace_model_dim(args.seidel_convention) is not None:
+                raise ValueError("--gt-fixed-seidel-indices only supports backend/classical Seidel vectors")
+            if int(gt_vec.numel()) != int(seidel.numel()):
+                raise ValueError(
+                    "--gt-fixed-seidel-indices requires GT vector and trainable vector "
+                    f"to have the same length, got {gt_vec.numel()} and {seidel.numel()}"
+                )
+            fixed_seidel_values[gt_fixed] = gt_vec[gt_fixed]
     result = train_cocoa_like(
         net_obj,
         seidel,
@@ -1079,11 +1122,8 @@ def run_one_mode(
         defocus_anchor_weight=args.defocus_anchor_weight,
         defocus_index=args.defocus_index,
         seidel_model_dim=trace_model_dim(args.seidel_convention),
-        fixed_seidel_indices=(
-            fixed_seidel_indices_for_convention(args.seidel_convention)
-            if trace_model_dim(args.seidel_convention) is None
-            else []
-        ),
+        fixed_seidel_indices=fixed_seidel_indices,
+        fixed_seidel_values=fixed_seidel_values,
         scheduler=args.scheduler,
         eta_min_ratio=args.eta_min_ratio,
         seidel_rms_prior_mode=args.seidel_rms_prior_mode,
@@ -1215,6 +1255,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     ap.add_argument(
+        "--gt-fixed-seidel-indices",
+        nargs="*",
+        type=int,
+        default=[],
+        help=(
+            "Backend-6 Seidel indices to lock to their GT values during joint "
+            "recovery. Example: 0 fixes W040 to GT while recovering the other terms."
+        ),
+    )
+    ap.add_argument(
         "--gt-label",
         default=None,
         help="Human-readable label for a custom Seidel vector.",
@@ -1235,6 +1285,12 @@ def main() -> None:
         raise ValueError("--seidel-rms-floor-field-samples must be >= 2")
     if args.seidel_rms_floor_pupil_samples < 3:
         raise ValueError("--seidel-rms-floor-pupil-samples must be >= 3")
+    args.gt_fixed_seidel_indices = sorted({int(idx) for idx in args.gt_fixed_seidel_indices})
+    invalid_gt_fixed = [idx for idx in args.gt_fixed_seidel_indices if idx < 0 or idx >= 6]
+    if invalid_gt_fixed:
+        raise ValueError(f"--gt-fixed-seidel-indices out of backend-6 range: {invalid_gt_fixed}")
+    if args.gt_fixed_seidel_indices and trace_model_dim(args.seidel_convention) is not None:
+        raise ValueError("--gt-fixed-seidel-indices only supports backend/classical Seidel conventions")
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if args.gt_seidel_json is not None:

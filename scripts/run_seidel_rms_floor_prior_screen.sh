@@ -37,6 +37,7 @@ FOURIER_NUM_ANGLES="${FOURIER_NUM_ANGLES:-60}"
 FOURIER_NUM_OCTAVES="${FOURIER_NUM_OCTAVES:-7}"
 RMS_FLOOR_FIELD_SAMPLES="${RMS_FLOOR_FIELD_SAMPLES:-21}"
 RMS_FLOOR_PUPIL_SAMPLES="${RMS_FLOOR_PUPIL_SAMPLES:-51}"
+GT_FIXED_SEIDEL_INDICES=(${GT_FIXED_SEIDEL_INDICES:-})
 
 NUM_SHARDS="${NUM_SHARDS:-1}"
 SHARD_INDEX="${SHARD_INDEX:-0}"
@@ -57,6 +58,7 @@ echo "[launcher] run_prefix=${RUN_PREFIX} size=${SIZE} pretrain=${PRETRAIN_ITER}
 echo "[launcher] images=${IMAGES[*]} directions=${DIRECTIONS[*]} strengths=${STRENGTHS[*]}"
 echo "[launcher] conventions=${CONVENTIONS[*]} alphas=${ALPHAS[*]} weights=${WEIGHTS[*]} rms_prior_mode=${RMS_PRIOR_MODE}"
 echo "[launcher] tuned params lr_obj=${LR_OBJ} lr_seidel=${LR_SEIDEL} rsd=${RSD_WEIGHT} max=${MAX_VAL} beta=${NERF_BETA}"
+echo "[launcher] gt_fixed_seidel_indices=${GT_FIXED_SEIDEL_INDICES[*]:-none}"
 if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-gpu=index,pci.bus_id,name,memory.used,memory.total,utilization.gpu --format=csv || true
 fi
@@ -101,6 +103,9 @@ for convention in "${CONVENTIONS[@]}"; do
         --num-shards "$NUM_SHARDS"
         --shard-index "$SHARD_INDEX"
       )
+      if [[ ${#GT_FIXED_SEIDEL_INDICES[@]} -gt 0 ]]; then
+        cmd+=(--gt-fixed-seidel-indices "${GT_FIXED_SEIDEL_INDICES[@]}")
+      fi
       if [[ "$CASE_SUBPROCESS" == "1" ]]; then
         cmd+=(--case-subprocess)
       fi

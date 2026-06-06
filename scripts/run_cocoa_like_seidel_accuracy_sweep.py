@@ -195,6 +195,7 @@ def run_args_for_case(
         seidel_rms_floor_target=candidate.actual_rms,
         seidel_rms_floor_field_samples=sweep_args.seidel_rms_floor_field_samples,
         seidel_rms_floor_pupil_samples=sweep_args.seidel_rms_floor_pupil_samples,
+        gt_fixed_seidel_indices=list(sweep_args.gt_fixed_seidel_indices),
         scheduler=sweep_args.scheduler,
         eta_min_ratio=sweep_args.eta_min_ratio,
         max_val=sweep_args.max_val,
@@ -257,6 +258,10 @@ def augment_metrics(
             "seidel_rms_floor_weight": float(config.get("seidel_rms_floor_weight", 0.0)),
             "seidel_rms_floor_alpha": float(config.get("seidel_rms_floor_alpha", 0.8)),
             "seidel_rms_floor_target": config.get("seidel_rms_floor_target"),
+            "gt_fixed_seidel_indices": list(config.get("gt_fixed_seidel_indices", [])),
+            "gt_fixed_seidel_values": [
+                float(gt[int(idx)]) for idx in config.get("gt_fixed_seidel_indices", [])
+            ],
             "wavefront_recovered_over_gt_rms": rec_rms / max(gt_rms, 1e-12),
             **cocoa.convention_metadata(seidel_convention),
         }
@@ -387,6 +392,8 @@ def write_csv(rows: list[dict], path: Path) -> None:
         "seidel_rms_floor_weight",
         "seidel_rms_floor_alpha",
         "seidel_rms_floor_target",
+        "gt_fixed_seidel_indices",
+        "gt_fixed_seidel_values",
         "final_seidel_rms_floor_loss",
         "final_seidel_wavefront_rms_floor_estimate",
         "l2_seidel_vs_gt",
@@ -818,6 +825,9 @@ def run_stage1_case_subprocess(
         "--skip-report",
         "--skip-config-write",
     ]
+    if args.gt_fixed_seidel_indices:
+        cmd.append("--gt-fixed-seidel-indices")
+        cmd.extend(str(int(idx)) for idx in args.gt_fixed_seidel_indices)
     if args.force:
         cmd.append("--force")
     if args.train_verbose:
@@ -991,10 +1001,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seidel-rms-floor-field-samples", type=int, default=21)
     parser.add_argument("--seidel-rms-floor-pupil-samples", type=int, default=51)
+    parser.add_argument(
+        "--gt-fixed-seidel-indices",
+        nargs="*",
+        type=int,
+        default=[],
+        help=(
+            "Backend-6 Seidel indices to lock to GT values while recovering "
+            "the remaining coefficients. Example: 0 fixes W040 to GT."
+        ),
+    )
     args = parser.parse_args()
     args.scheduler = None if args.scheduler == "none" else args.scheduler
     args.nerf_skips = cocoa.parse_nerf_skips(args.nerf_skips)
     args.strengths = parse_float_list(args.strengths, STRENGTHS)
+    args.gt_fixed_seidel_indices = sorted({int(idx) for idx in args.gt_fixed_seidel_indices})
+    invalid_gt_fixed = [idx for idx in args.gt_fixed_seidel_indices if idx < 0 or idx >= 6]
+    if invalid_gt_fixed:
+        raise ValueError(f"--gt-fixed-seidel-indices out of backend-6 range: {invalid_gt_fixed}")
     if args.seidel_rms_floor_weight < 0.0:
         raise ValueError("--seidel-rms-floor-weight must be non-negative")
     if args.seidel_rms_floor_alpha < 0.0:
