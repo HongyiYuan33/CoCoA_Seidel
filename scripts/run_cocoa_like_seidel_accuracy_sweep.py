@@ -196,6 +196,11 @@ def run_args_for_case(
         seidel_rms_floor_field_samples=sweep_args.seidel_rms_floor_field_samples,
         seidel_rms_floor_pupil_samples=sweep_args.seidel_rms_floor_pupil_samples,
         gt_fixed_seidel_indices=list(sweep_args.gt_fixed_seidel_indices),
+        seidel_lr_multipliers=(
+            None
+            if sweep_args.seidel_lr_multipliers is None
+            else list(sweep_args.seidel_lr_multipliers)
+        ),
         scheduler=sweep_args.scheduler,
         eta_min_ratio=sweep_args.eta_min_ratio,
         max_val=sweep_args.max_val,
@@ -262,6 +267,7 @@ def augment_metrics(
             "gt_fixed_seidel_values": [
                 float(gt[int(idx)]) for idx in config.get("gt_fixed_seidel_indices", [])
             ],
+            "seidel_lr_multipliers": config.get("seidel_lr_multipliers"),
             "wavefront_recovered_over_gt_rms": rec_rms / max(gt_rms, 1e-12),
             **cocoa.convention_metadata(seidel_convention),
         }
@@ -394,6 +400,7 @@ def write_csv(rows: list[dict], path: Path) -> None:
         "seidel_rms_floor_target",
         "gt_fixed_seidel_indices",
         "gt_fixed_seidel_values",
+        "seidel_lr_multipliers",
         "final_seidel_rms_floor_loss",
         "final_seidel_wavefront_rms_floor_estimate",
         "l2_seidel_vs_gt",
@@ -828,6 +835,13 @@ def run_stage1_case_subprocess(
     if args.gt_fixed_seidel_indices:
         cmd.append("--gt-fixed-seidel-indices")
         cmd.extend(str(int(idx)) for idx in args.gt_fixed_seidel_indices)
+    if args.seidel_lr_multipliers is not None:
+        cmd.extend(
+            [
+                "--seidel-lr-multipliers-json",
+                json.dumps([float(value) for value in args.seidel_lr_multipliers]),
+            ]
+        )
     if args.force:
         cmd.append("--force")
     if args.train_verbose:
@@ -956,6 +970,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage3-num-iter", type=int, default=STAGE3["num_iter"])
     parser.add_argument("--lr-obj", type=float, default=5e-3)
     parser.add_argument("--lr-seidel", type=float, default=1e-2)
+    parser.add_argument(
+        "--seidel-lr-multipliers-json",
+        default=None,
+        help=(
+            "Optional JSON/list multipliers applied to Seidel gradients before "
+            "the optimizer step. Example '[10,1,1,1,1,1]' makes W040 use 10x "
+            "the base Seidel learning rate."
+        ),
+    )
     parser.add_argument("--rsd-weight", type=float, default=5e-4)
     parser.add_argument("--tv-weight", type=float, default=0.0)
     parser.add_argument("--pretrain-scalar", type=float, default=5.0)
@@ -1015,6 +1038,21 @@ def parse_args() -> argparse.Namespace:
     args.scheduler = None if args.scheduler == "none" else args.scheduler
     args.nerf_skips = cocoa.parse_nerf_skips(args.nerf_skips)
     args.strengths = parse_float_list(args.strengths, STRENGTHS)
+    if args.seidel_lr_multipliers_json:
+        args.seidel_lr_multipliers = cocoa.parse_float_vector_json(
+            args.seidel_lr_multipliers_json,
+            name="--seidel-lr-multipliers-json",
+        )
+        expected_dim = cocoa.active_backend_dim(args.seidel_convention)
+        if len(args.seidel_lr_multipliers) != expected_dim:
+            raise ValueError(
+                "--seidel-lr-multipliers-json length must match trainable Seidel "
+                f"dimension {expected_dim}, got {len(args.seidel_lr_multipliers)}"
+            )
+        if any(value < 0.0 for value in args.seidel_lr_multipliers):
+            raise ValueError("--seidel-lr-multipliers-json values must be non-negative")
+    else:
+        args.seidel_lr_multipliers = None
     args.gt_fixed_seidel_indices = sorted({int(idx) for idx in args.gt_fixed_seidel_indices})
     invalid_gt_fixed = [idx for idx in args.gt_fixed_seidel_indices if idx < 0 or idx >= 6]
     if invalid_gt_fixed:

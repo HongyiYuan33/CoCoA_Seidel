@@ -25,6 +25,7 @@ PREFERRED_FIELDS = [
     "fixed_seidel_indices",
     "gt_fixed_seidel_indices",
     "gt_fixed_seidel_values",
+    "seidel_lr_multipliers",
     "seidel_gt",
     "seidel_final",
     "ssim_recon_gain_vs_gt",
@@ -89,6 +90,10 @@ def row_from_metrics(metrics_path: Path, output_root: Path) -> dict[str, Any]:
             config.get("gt_fixed_seidel_indices", []),
         ),
         "gt_fixed_seidel_values": metrics.get("gt_fixed_seidel_values", []),
+        "seidel_lr_multipliers": metrics.get(
+            "seidel_lr_multipliers",
+            config.get("seidel_lr_multipliers", None),
+        ),
         "seidel_gt": metrics.get("seidel_gt"),
         "seidel_final": metrics.get("seidel_final"),
         "ssim_recon_gain_vs_gt": metrics.get("ssim_recon_gain_vs_gt"),

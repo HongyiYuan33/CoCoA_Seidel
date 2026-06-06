@@ -211,6 +211,19 @@ def parse_seidel_json(raw: str, *, convention: str) -> np.ndarray:
     return arr
 
 
+def parse_float_vector_json(raw: str, *, name: str) -> list[float]:
+    """Parse a JSON/list float vector for optimizer controls."""
+
+    try:
+        values = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} is not valid JSON: {raw!r}") from exc
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} contains non-finite values")
+    return [float(value) for value in arr]
+
+
 def preset_for_convention(preset: str, convention: str) -> np.ndarray:
     backend = SEIDEL_PRESETS[preset]
     if convention in CLASSICAL_CONVENTIONS:
@@ -560,6 +573,7 @@ def train_cocoa_like(
     seidel_model_dim: int | None,
     fixed_seidel_indices: Sequence[int] | None,
     fixed_seidel_values: Sequence[float] | torch.Tensor | None,
+    seidel_lr_multipliers: Sequence[float] | torch.Tensor | None,
     scheduler: str | None,
     eta_min_ratio: float,
     seidel_rms_prior_mode: str,
@@ -597,6 +611,19 @@ def train_cocoa_like(
         fixed_mask[list(fixed)] = 0.0
         with torch.no_grad():
             seidel_coeffs[list(fixed)] = fixed_values_tensor[list(fixed)]
+
+    seidel_lr_multipliers_tensor: torch.Tensor | None = None
+    if seidel_lr_multipliers is not None:
+        seidel_lr_multipliers_tensor = torch.as_tensor(
+            seidel_lr_multipliers,
+            device=seidel_coeffs.device,
+            dtype=seidel_coeffs.dtype,
+        ).reshape(-1)
+        if int(seidel_lr_multipliers_tensor.numel()) != int(seidel_coeffs.numel()):
+            raise ValueError(
+                "seidel_lr_multipliers must match parameter length "
+                f"{seidel_coeffs.numel()}, got {seidel_lr_multipliers_tensor.numel()}"
+            )
 
     param_groups: list[dict] = [{"params": net_obj.parameters(), "lr": lr_obj}]
     if seidel_coeffs.requires_grad:
@@ -740,6 +767,8 @@ def train_cocoa_like(
 
         optimizer.zero_grad()
         loss.backward()
+        if seidel_lr_multipliers_tensor is not None and seidel_coeffs.grad is not None:
+            seidel_coeffs.grad.mul_(seidel_lr_multipliers_tensor)
         optimizer.step()
         if fixed and seidel_coeffs.requires_grad:
             assert fixed_values_tensor is not None
@@ -885,6 +914,9 @@ def compute_metrics(
         "gt_fixed_seidel_values": [
             float(gt_seidel[idx]) for idx in getattr(args, "gt_fixed_seidel_indices", [])
         ],
+        "seidel_lr_multipliers": (
+            None if args.seidel_lr_multipliers is None else list(args.seidel_lr_multipliers)
+        ),
         "best_gain_recon_to_gt": gain,
         "nrmse_recon_raw_vs_gt": compute_nrmse(sgt, sr),
         "nrmse_recon_gain_vs_gt": compute_nrmse(sgt, sr_gain),
@@ -1077,7 +1109,8 @@ def run_one_mode(
         f"rms_prior_mode={args.seidel_rms_prior_mode} "
         f"rms_floor_weight={args.seidel_rms_floor_weight:g} "
         f"rms_floor_alpha={args.seidel_rms_floor_alpha:g} "
-        f"rms_floor_target={args.seidel_rms_floor_target}",
+        f"rms_floor_target={args.seidel_rms_floor_target} "
+        f"seidel_lr_multipliers={args.seidel_lr_multipliers}",
         flush=True,
     )
     t0 = time.time()
@@ -1124,6 +1157,7 @@ def run_one_mode(
         seidel_model_dim=trace_model_dim(args.seidel_convention),
         fixed_seidel_indices=fixed_seidel_indices,
         fixed_seidel_values=fixed_seidel_values,
+        seidel_lr_multipliers=args.seidel_lr_multipliers,
         scheduler=args.scheduler,
         eta_min_ratio=args.eta_min_ratio,
         seidel_rms_prior_mode=args.seidel_rms_prior_mode,
@@ -1182,6 +1216,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--pretrain-iter", type=int, default=400)
     ap.add_argument("--lr-obj", type=float, default=5e-3)
     ap.add_argument("--lr-seidel", type=float, default=1e-2)
+    ap.add_argument(
+        "--seidel-lr-multipliers-json",
+        default=None,
+        help=(
+            "Optional JSON/list multipliers applied to Seidel gradients before "
+            "the optimizer step. Example '[10,1,1,1,1,1]' makes W040 use 10x "
+            "the effective Seidel learning rate in backend-6 order."
+        ),
+    )
     ap.add_argument("--rsd-weight", type=float, default=5e-4)
     ap.add_argument("--tv-weight", type=float, default=0.0)
     ap.add_argument("--pretrain-scalar", type=float, default=5.0)
@@ -1291,6 +1334,21 @@ def main() -> None:
         raise ValueError(f"--gt-fixed-seidel-indices out of backend-6 range: {invalid_gt_fixed}")
     if args.gt_fixed_seidel_indices and trace_model_dim(args.seidel_convention) is not None:
         raise ValueError("--gt-fixed-seidel-indices only supports backend/classical Seidel conventions")
+    if args.seidel_lr_multipliers_json:
+        args.seidel_lr_multipliers = parse_float_vector_json(
+            args.seidel_lr_multipliers_json,
+            name="--seidel-lr-multipliers-json",
+        )
+        expected_dim = int(trace_model_dim(args.seidel_convention) or 6)
+        if len(args.seidel_lr_multipliers) != expected_dim:
+            raise ValueError(
+                "--seidel-lr-multipliers-json length must match trainable Seidel "
+                f"dimension {expected_dim}, got {len(args.seidel_lr_multipliers)}"
+            )
+        if any(value < 0.0 for value in args.seidel_lr_multipliers):
+            raise ValueError("--seidel-lr-multipliers-json values must be non-negative")
+    else:
+        args.seidel_lr_multipliers = None
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if args.gt_seidel_json is not None:
