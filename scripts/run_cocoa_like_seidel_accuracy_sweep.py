@@ -55,6 +55,7 @@ class Candidate:
     target_rms: float
     seidel: np.ndarray
     actual_rms: float
+    coeff_rms: float
 
 
 def tag_float(value: float) -> str:
@@ -128,6 +129,7 @@ def make_candidates(
         for target in strengths:
             seidel = base * (target / base_rms)
             actual = field_weighted_wavefront_rms(seidel)
+            coeff_rms = cocoa.seidel_coefficient_rms_np(seidel)
             candidate_id = f"{direction}__rms{tag_float(target)}"
             candidates.append(
                 Candidate(
@@ -136,6 +138,7 @@ def make_candidates(
                     target_rms=float(target),
                     seidel=seidel.astype(np.float32),
                     actual_rms=actual,
+                    coeff_rms=coeff_rms,
                 )
             )
     return candidates
@@ -175,6 +178,8 @@ def run_args_for_case(
     seidel_convention: str,
     sweep_args: argparse.Namespace,
 ) -> SimpleNamespace:
+    prior_measure = str(getattr(sweep_args, "seidel_rms_prior_measure", "wavefront"))
+    prior_target = candidate.coeff_rms if prior_measure == "coefficient" else candidate.actual_rms
     return SimpleNamespace(
         image=image,
         size=size,
@@ -191,9 +196,12 @@ def run_args_for_case(
         defocus_index=sweep_args.defocus_index,
         seidel_parameterization=sweep_args.seidel_parameterization,
         seidel_rms_prior_mode=sweep_args.seidel_rms_prior_mode,
+        seidel_rms_prior_measure=prior_measure,
         seidel_rms_floor_weight=sweep_args.seidel_rms_floor_weight,
         seidel_rms_floor_alpha=sweep_args.seidel_rms_floor_alpha,
-        seidel_rms_floor_target=candidate.actual_rms,
+        seidel_rms_floor_target=prior_target,
+        target_wavefront_rms=candidate.actual_rms,
+        target_coeff_rms=candidate.coeff_rms,
         seidel_rms_floor_field_samples=sweep_args.seidel_rms_floor_field_samples,
         seidel_rms_floor_pupil_samples=sweep_args.seidel_rms_floor_pupil_samples,
         gt_fixed_seidel_indices=list(sweep_args.gt_fixed_seidel_indices),
@@ -236,6 +244,8 @@ def augment_metrics(
     gt_rms = field_weighted_wavefront_rms(gt)
     rec_rms = field_weighted_wavefront_rms(rec)
     err_rms = field_weighted_wavefront_rms(rec - gt)
+    gt_coeff_rms = cocoa.seidel_coefficient_rms_np(gt)
+    rec_coeff_rms = cocoa.seidel_coefficient_rms_np(rec)
     signblind_err_rms = min(err_rms, field_weighted_wavefront_rms((-rec) - gt))
     coeff_l2 = float(np.linalg.norm(rec - gt))
     coeff_rel = coeff_l2 / max(float(np.linalg.norm(gt)), 1e-12)
@@ -250,17 +260,22 @@ def augment_metrics(
             "candidate_id": candidate.candidate_id,
             "direction": candidate.direction,
             "target_wavefront_rms": candidate.target_rms,
+            "target_coeff_rms": candidate.coeff_rms,
             "actual_wavefront_rms": candidate.actual_rms,
             "wavefront_gt_rms": gt_rms,
             "wavefront_recovered_rms": rec_rms,
             "wavefront_error_rms": err_rms,
             "relative_wavefront_error": err_rms / max(gt_rms, 1e-12),
+            "coeff_gt_rms": gt_coeff_rms,
+            "coeff_recovered_rms": rec_coeff_rms,
+            "coeff_recovered_over_gt_rms": rec_coeff_rms / max(gt_coeff_rms, 1e-12),
             "signblind_wavefront_error_rms": signblind_err_rms,
             "signblind_relative_wavefront_error": signblind_err_rms / max(gt_rms, 1e-12),
             "seidel_l2_relative": coeff_rel,
             "measurement_hf_drop": 1.0 - (meas_hf / max(gt_hf, 1e-12)),
             "seidel_convention": seidel_convention,
             "seidel_rms_prior_mode": str(config.get("seidel_rms_prior_mode", "floor")),
+            "seidel_rms_prior_measure": str(config.get("seidel_rms_prior_measure", "wavefront")),
             "seidel_rms_floor_weight": float(config.get("seidel_rms_floor_weight", 0.0)),
             "seidel_rms_floor_alpha": float(config.get("seidel_rms_floor_alpha", 0.8)),
             "seidel_rms_floor_target": config.get("seidel_rms_floor_target"),
@@ -298,7 +313,12 @@ def run_case(
     case_dir = metrics_path.parents[1]
     if metrics_path.is_file() and not force:
         metrics = json.loads(metrics_path.read_text())
-        if "relative_wavefront_error" not in metrics or "fixed_seidel_indices" not in metrics:
+        if (
+            "relative_wavefront_error" not in metrics
+            or "fixed_seidel_indices" not in metrics
+            or "coeff_recovered_over_gt_rms" not in metrics
+            or "seidel_rms_prior_measure" not in metrics
+        ):
             metrics = augment_metrics(
                 metrics,
                 stage=stage,
@@ -390,15 +410,20 @@ def write_csv(rows: list[dict], path: Path) -> None:
         "candidate_id",
         "direction",
         "target_wavefront_rms",
+        "target_coeff_rms",
         "actual_wavefront_rms",
         "wavefront_gt_rms",
         "wavefront_recovered_rms",
         "wavefront_recovered_over_gt_rms",
+        "coeff_gt_rms",
+        "coeff_recovered_rms",
+        "coeff_recovered_over_gt_rms",
         "relative_wavefront_error",
         "wavefront_error_rms",
         "signblind_relative_wavefront_error",
         "seidel_l2_relative",
         "seidel_rms_prior_mode",
+        "seidel_rms_prior_measure",
         "seidel_rms_floor_weight",
         "seidel_rms_floor_alpha",
         "seidel_rms_floor_target",
@@ -830,6 +855,8 @@ def run_stage1_case_subprocess(
         str(args.fourier_num_octaves),
         "--seidel-rms-prior-mode",
         args.seidel_rms_prior_mode,
+        "--seidel-rms-prior-measure",
+        args.seidel_rms_prior_measure,
         "--seidel-rms-floor-weight",
         str(args.seidel_rms_floor_weight),
         "--seidel-rms-floor-alpha",
@@ -1027,6 +1054,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--seidel-rms-prior-measure",
+        choices=cocoa.SEIDEL_RMS_PRIOR_MEASURES,
+        default="wavefront",
+        help="Strength measure controlled by the Seidel RMS prior.",
+    )
+    parser.add_argument(
         "--seidel-rms-floor-weight",
         type=float,
         default=0.0,
@@ -1114,6 +1147,7 @@ def write_sweep_config(output_root: Path, args: argparse.Namespace, candidates: 
                         "direction": candidate.direction,
                         "target_rms": candidate.target_rms,
                         "actual_rms": candidate.actual_rms,
+                        "coeff_rms": candidate.coeff_rms,
                         "seidel": candidate.seidel.tolist(),
                     }
                     for candidate in candidates
