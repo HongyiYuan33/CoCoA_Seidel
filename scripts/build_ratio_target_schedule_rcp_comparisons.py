@@ -249,6 +249,10 @@ def draw_coeff_card(
     prior_loss = parse_float(row, "final_seidel_rms_floor_loss")
     target_ratio = target_ratio_for_case(case)
     target_abs = target * target_ratio if math.isfinite(target_ratio) else math.nan
+    raw_sign = parse_float(row, "canonical_sign_match_rate_raw")
+    phys_sign = parse_float(row, "canonical_sign_match_rate_physical")
+    gauge_sign = parse_float(row, "canonical_sign_match_rate_gauge")
+    gauge_transform = row.get("canonical_transform_gauge", "?")
 
     ax_text = fig.add_subplot(sub[0, 0])
     ax_text.axis("off")
@@ -264,6 +268,10 @@ def draw_coeff_card(
             f"target={short_float(target_ratio, 3)}x GT ({short_float(target_abs)}) | "
             f"prior_loss={short_float(prior_loss, 3)} | SSIM={short_float(ssim)} | "
             f"NRMSE={short_float(nrmse)} | gain={short_float(float(metrics.get('best_gain_recon_to_gt', math.nan)), 3)}"
+        ),
+        (
+            f"sign raw={short_float(raw_sign, 2)} | phys={short_float(phys_sign, 2)} | "
+            f"gauge={short_float(gauge_sign, 2)} | gauge_g={gauge_transform}"
         ),
         wrap_line(
             f"id={row.get('candidate_id', '')} | run={short_run_name(row.get('run_root', ''))}",

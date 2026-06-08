@@ -51,6 +51,13 @@ COORDINATE_DIAGNOSTIC_TRANSFORMS: tuple[str, ...] = (
     "twin",
     "twin_mirror",
 )
+GAUGE_TRANSFORM_SET: tuple[str, ...] = COORDINATE_DIAGNOSTIC_TRANSFORMS
+GAUGE_TRANSFORM_ALIASES: dict[str, tuple[str, ...]] = {
+    "I": ("identity", "y_reflection"),
+    "mirror_x": ("x_reflection", "rot180"),
+    "twin": ("phase_conjugate_twin",),
+    "twin_mirror": ("phase_conjugate_twin_mirror",),
+}
 # Trace-separated evaluator helpers are paused for default experiments and
 # retained only for explicit reproduction/diagnostics of previous trace runs.
 TRACE5_TRANSFORM_SIGNS: dict[str, tuple[float, ...]] = {
@@ -801,6 +808,164 @@ def _choose_best_transform(
     return best, errors[best]
 
 
+def _sign_vector(theta: np.ndarray, *, tol: float = 1e-8) -> list[int]:
+    signs: list[int] = []
+    for value in np.asarray(theta, dtype=np.float64).reshape(-1):
+        if abs(float(value)) <= tol:
+            signs.append(0)
+        elif float(value) > 0.0:
+            signs.append(1)
+        else:
+            signs.append(-1)
+    return signs
+
+
+def _sign_agreement_report(
+    theta_gt: np.ndarray,
+    theta_candidate: np.ndarray,
+    *,
+    coeff_names: Sequence[str],
+    fixed_indices: Sequence[int],
+    tol: float = 1e-8,
+) -> dict[str, Any]:
+    gt = np.asarray(theta_gt, dtype=np.float64).reshape(-1)
+    cand = np.asarray(theta_candidate, dtype=np.float64).reshape(-1)
+    gt_sign = _sign_vector(gt, tol=tol)
+    cand_sign = _sign_vector(cand, tol=tol)
+    fixed = set(int(idx) for idx in fixed_indices)
+    matches: list[bool | None] = []
+    mismatch_coeffs: list[str] = []
+    valid = 0
+    matched = 0
+    for idx, (sgt, scand) in enumerate(zip(gt_sign, cand_sign)):
+        name = str(coeff_names[idx]) if idx < len(coeff_names) else f"theta{idx}"
+        if idx in fixed or sgt == 0:
+            matches.append(None)
+            continue
+        valid += 1
+        is_match = bool(scand == sgt)
+        matches.append(is_match)
+        if is_match:
+            matched += 1
+        else:
+            mismatch_coeffs.append(name)
+    return {
+        "sign_gt": gt_sign,
+        "sign_hat": cand_sign,
+        "sign_match": matches,
+        "sign_match_rate": float(matched / valid) if valid else float("nan"),
+        "sign_mismatch_coeffs": mismatch_coeffs,
+        "sign_valid_coeff_count": int(valid),
+    }
+
+
+def _canonical_summary(
+    theta_gt: np.ndarray,
+    theta_hat: np.ndarray,
+    *,
+    raw_errors: Mapping[str, Any],
+    physical_transform: str,
+    physical: Mapping[str, Any],
+    gauge_transform: str,
+    gauge: Mapping[str, Any],
+    fixed_indices: Sequence[int],
+    coeff_names: Sequence[str],
+    config: OperatorProbeConfig,
+) -> dict[str, Any]:
+    physical_theta = np.asarray(physical["aligned"], dtype=np.float64).reshape(-1)
+    gauge_theta = np.asarray(gauge["aligned"], dtype=np.float64).reshape(-1)
+    raw_report = _sign_agreement_report(
+        theta_gt,
+        theta_hat,
+        coeff_names=coeff_names,
+        fixed_indices=fixed_indices,
+    )
+    physical_report = _sign_agreement_report(
+        theta_gt,
+        physical_theta,
+        coeff_names=coeff_names,
+        fixed_indices=fixed_indices,
+    )
+    gauge_report = _sign_agreement_report(
+        theta_gt,
+        gauge_theta,
+        coeff_names=coeff_names,
+        fixed_indices=fixed_indices,
+    )
+
+    gt_rms = field_weighted_wavefront_rms(
+        theta_gt,
+        field_samples=config.wavefront_field_samples,
+        pupil_samples=config.wavefront_pupil_samples,
+    )
+    raw_rms = field_weighted_wavefront_rms(
+        theta_hat,
+        field_samples=config.wavefront_field_samples,
+        pupil_samples=config.wavefront_pupil_samples,
+    )
+    physical_rms = field_weighted_wavefront_rms(
+        physical_theta,
+        field_samples=config.wavefront_field_samples,
+        pupil_samples=config.wavefront_pupil_samples,
+    )
+    gauge_rms = field_weighted_wavefront_rms(
+        gauge_theta,
+        field_samples=config.wavefront_field_samples,
+        pupil_samples=config.wavefront_pupil_samples,
+    )
+    denom = max(float(gt_rms), float(config.eps))
+    return {
+        "canonical_sign_source": "gauge",
+        "canonical_gauge_v1_note": (
+            "Gauge v1 uses hard-coded discrete transforms only; continuous "
+            "recenter/refocus is not enabled in the current forward model."
+        ),
+        "canonical_gauge_transform_aliases": {
+            key: list(value) for key, value in GAUGE_TRANSFORM_ALIASES.items()
+        },
+        "theta_hat_canonical_physical": [float(value) for value in physical_theta],
+        "canonical_transform_physical": physical_transform,
+        "canonical_transform_physical_aliases": list(
+            GAUGE_TRANSFORM_ALIASES.get(physical_transform, (physical_transform,))
+        ),
+        "canonical_operator_error_physical": float(physical["operator"]),
+        "canonical_wavefront_error_physical": float(physical["wavefront"]),
+        "canonical_coeff_absolute_error_physical": float(physical["coeff_abs"]),
+        "canonical_coeff_relative_error_physical": float(physical["coeff_rel"]),
+        "theta_hat_canonical_gauge": [float(value) for value in gauge_theta],
+        "canonical_transform_gauge": gauge_transform,
+        "canonical_transform_gauge_aliases": list(
+            GAUGE_TRANSFORM_ALIASES.get(gauge_transform, (gauge_transform,))
+        ),
+        "canonical_operator_error_gauge": float(gauge["operator"]),
+        "canonical_wavefront_error_gauge": float(gauge["wavefront"]),
+        "canonical_coeff_absolute_error_gauge": float(gauge["coeff_abs"]),
+        "canonical_coeff_relative_error_gauge": float(gauge["coeff_rel"]),
+        "raw_wavefront_rms_eval": float(raw_rms),
+        "canonical_wavefront_rms_physical": float(physical_rms),
+        "canonical_wavefront_rms_gauge": float(gauge_rms),
+        "raw_recovered_over_gt_wavefront_rms_eval": float(raw_rms / denom),
+        "canonical_recovered_over_gt_wavefront_rms_physical": float(physical_rms / denom),
+        "canonical_recovered_over_gt_wavefront_rms_gauge": float(gauge_rms / denom),
+        "canonical_sign_match_raw": raw_report["sign_match"],
+        "canonical_sign_match_rate_raw": raw_report["sign_match_rate"],
+        "canonical_sign_mismatch_coeffs_raw": raw_report["sign_mismatch_coeffs"],
+        "canonical_sign_valid_coeff_count_raw": raw_report["sign_valid_coeff_count"],
+        "canonical_sign_gt": raw_report["sign_gt"],
+        "canonical_sign_hat_raw": raw_report["sign_hat"],
+        "canonical_sign_match_physical": physical_report["sign_match"],
+        "canonical_sign_match_rate_physical": physical_report["sign_match_rate"],
+        "canonical_sign_mismatch_coeffs_physical": physical_report["sign_mismatch_coeffs"],
+        "canonical_sign_valid_coeff_count_physical": physical_report["sign_valid_coeff_count"],
+        "canonical_sign_hat_physical": physical_report["sign_hat"],
+        "canonical_sign_match_gauge": gauge_report["sign_match"],
+        "canonical_sign_match_rate_gauge": gauge_report["sign_match_rate"],
+        "canonical_sign_mismatch_coeffs_gauge": gauge_report["sign_mismatch_coeffs"],
+        "canonical_sign_valid_coeff_count_gauge": gauge_report["sign_valid_coeff_count"],
+        "canonical_sign_hat_gauge": gauge_report["sign_hat"],
+    }
+
+
 def _ambiguity_gap(errors: Mapping[str, Mapping[str, Any]], calibrated_error: float) -> float:
     if len(errors) <= 1:
         return 0.0
@@ -1074,6 +1239,18 @@ def evaluate_seidel_recovery(
         physical_transforms,
         fixed_indices=fixed,
     )
+    canonical = _canonical_summary(
+        gt,
+        hat,
+        raw_errors=calibrated,
+        physical_transform=best_physical_transform,
+        physical=best_physical,
+        gauge_transform=best_coord_transform,
+        gauge=best_coord,
+        fixed_indices=fixed,
+        coeff_names=SEIDEL_COEFF_NAMES,
+        config=config,
+    )
 
     output: dict[str, Any] = {
         "operator_error_calibrated": float(calibrated["operator"]),
@@ -1118,9 +1295,11 @@ def evaluate_seidel_recovery(
         "probe_group_weights": config.resolved_group_weights(),
         "probe_group_counts": evaluator.probe_group_counts(),
         "physical_transform_set": list(physical_transforms),
+        "gauge_transform_set": list(GAUGE_TRANSFORM_SET),
         "coordinate_diagnostic_transform_set": list(COORDINATE_DIAGNOSTIC_TRANSFORMS),
         "fixed_seidel_indices": list(fixed),
     }
+    output.update(canonical)
     return output
 
 
@@ -1268,6 +1447,45 @@ def evaluate_trace_seidel_recovery(
         )
         for transform in physical_transforms
     )
+    fixed_trace_indices = [5] if dim_model == 5 else [4, 5]
+    physical_backend_coeff_abs, physical_backend_coeff_rel = coefficient_residuals(
+        gt_backend,
+        np.asarray(best_physical["aligned_backend"], dtype=np.float64),
+        eps=config.eps,
+    )
+    gauge_backend_coeff_abs, gauge_backend_coeff_rel = coefficient_residuals(
+        gt_backend,
+        np.asarray(best_coord["aligned_backend"], dtype=np.float64),
+        eps=config.eps,
+    )
+    physical_backend = dict(best_physical)
+    physical_backend.update(
+        {
+            "aligned": np.asarray(best_physical["aligned_backend"], dtype=np.float64),
+            "coeff_abs": physical_backend_coeff_abs,
+            "coeff_rel": physical_backend_coeff_rel,
+        }
+    )
+    gauge_backend = dict(best_coord)
+    gauge_backend.update(
+        {
+            "aligned": np.asarray(best_coord["aligned_backend"], dtype=np.float64),
+            "coeff_abs": gauge_backend_coeff_abs,
+            "coeff_rel": gauge_backend_coeff_rel,
+        }
+    )
+    canonical = _canonical_summary(
+        gt_backend,
+        hat_backend,
+        raw_errors=calibrated,
+        physical_transform=best_physical_transform,
+        physical=physical_backend,
+        gauge_transform=best_coord_transform,
+        gauge=gauge_backend,
+        fixed_indices=fixed_trace_indices,
+        coeff_names=SEIDEL_COEFF_NAMES,
+        config=config,
+    )
 
     symmetry_status = {
         "eta_1": "not_applicable",
@@ -1276,7 +1494,6 @@ def evaluate_trace_seidel_recovery(
         "field_scaling_residual": "not_applicable",
         "symmetry_diagnostic_source": "not_applicable_no_local_proxy",
     }
-    fixed_trace_indices = [5] if dim_model == 5 else [4, 5]
 
     output: dict[str, Any] = {
         "theta_convention": f"trace{dim_model}",
@@ -1343,9 +1560,11 @@ def evaluate_trace_seidel_recovery(
         "probe_group_counts": evaluator.probe_group_counts(),
         "calibrated_transform_set": ["I"],
         "physical_transform_set": list(physical_transforms),
+        "gauge_transform_set": list(GAUGE_TRANSFORM_SET),
         "coordinate_diagnostic_transform_set": list(COORDINATE_DIAGNOSTIC_TRANSFORMS),
         "fixed_seidel_indices": fixed_trace_indices,
     }
+    output.update(canonical)
     output.update(symmetry_status)
     return output
 

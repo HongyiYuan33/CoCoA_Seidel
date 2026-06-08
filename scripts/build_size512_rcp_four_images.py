@@ -205,6 +205,10 @@ def make_panel(
     aligned_wf = parse_float(eval_row, "aligned_wavefront_error_physical")
     ssim = parse_float(eval_row, "ssim_recon_gain_vs_gt")
     nrmse = parse_float(eval_row, "nrmse_recon_gain_vs_gt")
+    raw_sign = parse_float(eval_row, "canonical_sign_match_rate_raw")
+    phys_sign = parse_float(eval_row, "canonical_sign_match_rate_physical")
+    gauge_sign = parse_float(eval_row, "canonical_sign_match_rate_gauge")
+    gauge_transform = eval_row.get("canonical_transform_gauge", "?")
 
     rank = int(case["rank"])
     file_name = (
@@ -272,6 +276,10 @@ def make_panel(
             f"best_phys={eval_row.get('best_physical_transform', '?')} | "
             f"aligned_WFrel={short_float(aligned_wf)} | "
             f"SSIM={short_float(ssim)} | NRMSE={short_float(nrmse)}"
+        ),
+        (
+            f"sign raw={short_float(raw_sign, 2)} | phys={short_float(phys_sign, 2)} | "
+            f"gauge={short_float(gauge_sign, 2)} | gauge_g={gauge_transform}"
         ),
         wrapped(f"run={case['run_dir']}", width=92),
     ]

@@ -8,6 +8,7 @@ import csv
 import datetime as dt
 import json
 import math
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -512,6 +513,46 @@ def write_report_csvs(output_root: Path, args: argparse.Namespace) -> list[dict[
     return rows
 
 
+def maybe_run_gauge_aware_operator_eval(
+    output_root: Path,
+    args: argparse.Namespace,
+    rows: list[dict[str, Any]],
+) -> None:
+    expected = len(build_all_cases(args))
+    if args.skip_operator_eval:
+        print("[operator-eval] skipped by --skip-operator-eval", flush=True)
+        return
+    if len(rows) != expected:
+        print(
+            f"[operator-eval] skipped until all cases complete ({len(rows)}/{expected})",
+            flush=True,
+        )
+        return
+    if args.num_shards > 1 and not args.report_only:
+        print(
+            "[operator-eval] skipped inside sharded training worker; run --report-only "
+            "after all shards finish.",
+            flush=True,
+        )
+        return
+    input_csv = output_root / "oracle_controls_operator_input.csv"
+    eval_dir = output_root / f"gauge_aware_operator_eval_dim{int(args.operator_eval_dim)}"
+    cmd = [
+        sys.executable,
+        str(HERE / "run_gauge_aware_operator_eval_pipeline.py"),
+        str(input_csv),
+        str(eval_dir),
+        "--dim",
+        str(int(args.operator_eval_dim)),
+        "--dataset-twin-invariance-pass",
+        str(args.operator_eval_dataset_twin_invariance_pass),
+    ]
+    if args.operator_eval_resume:
+        cmd.append("--resume")
+    print("[operator-eval]", " ".join(cmd), flush=True)
+    subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-name", default=None)
@@ -549,6 +590,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-verbose", action="store_true")
     parser.add_argument("--report-only", action="store_true")
     parser.add_argument("--skip-config-write", action="store_true")
+    parser.add_argument("--skip-operator-eval", action="store_true")
+    parser.add_argument("--operator-eval-dim", type=int, default=256)
+    parser.add_argument("--operator-eval-resume", action="store_true", default=True)
+    parser.add_argument("--operator-eval-dataset-twin-invariance-pass", default="auto")
     args = parser.parse_args()
     args.scheduler = None if args.scheduler == "none" else args.scheduler
     args.nerf_skips = cocoa.parse_nerf_skips(args.nerf_skips)
@@ -628,6 +673,7 @@ def main() -> None:
                 force=args.force,
             )
     rows = write_report_csvs(output_root, args)
+    maybe_run_gauge_aware_operator_eval(output_root, args, rows)
     print(f"[done] wrote reports for {len(rows)} completed cases under {output_root}", flush=True)
 
 

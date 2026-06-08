@@ -1,6 +1,8 @@
 """Evaluation helpers for Seidel recovery experiments."""
 
 from .seidel_operator_evaluator import (
+    GAUGE_TRANSFORM_ALIASES,
+    GAUGE_TRANSFORM_SET,
     OPERATOR_TRANSFORM_ORDER,
     SEIDEL_COEFF_NAMES,
     SEIDEL_TRANSFORM_SIGNS,
@@ -12,6 +14,8 @@ from .seidel_operator_evaluator import (
 )
 
 __all__ = [
+    "GAUGE_TRANSFORM_ALIASES",
+    "GAUGE_TRANSFORM_SET",
     "OPERATOR_TRANSFORM_ORDER",
     "SEIDEL_COEFF_NAMES",
     "SEIDEL_TRANSFORM_SIGNS",

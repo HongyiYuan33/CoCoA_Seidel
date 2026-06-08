@@ -232,6 +232,10 @@ def draw_coeff_card(
     nrmse = parse_float(row, "nrmse_recon_gain_vs_gt")
     ratio = parse_float(row, "wavefront_recovered_over_gt_rms")
     target = parse_float(row, "target_wavefront_rms")
+    raw_sign = parse_float(row, "canonical_sign_match_rate_raw")
+    phys_sign = parse_float(row, "canonical_sign_match_rate_physical")
+    gauge_sign = parse_float(row, "canonical_sign_match_rate_gauge")
+    gauge_transform = row.get("canonical_transform_gauge", "?")
 
     ax_text = fig.add_subplot(sub[0, 0])
     ax_text.axis("off")
@@ -249,6 +253,11 @@ def draw_coeff_card(
             f"best_phys={row.get('best_physical_transform', '?')} | "
             f"SSIM={short_float(ssim)} | NRMSE={short_float(nrmse)} | "
             f"gain={short_float(float(metrics.get('best_gain_recon_to_gt', math.nan)), 3)}"
+        ),
+        (
+            f"sign raw={short_float(raw_sign, 2)} | "
+            f"phys={short_float(phys_sign, 2)} | "
+            f"gauge={short_float(gauge_sign, 2)} | gauge_g={gauge_transform}"
         ),
         wrap_line(
             f"id={row.get('candidate_id', '')} | run={short_run_name(row.get('run_root', ''))}",

@@ -1,10 +1,11 @@
-"""Augment Seidel sweep CSVs with physical-operator recovery metrics.
+"""Augment Seidel sweep CSVs with gauge-aware operator recovery metrics.
 
-This is the post-hoc full physical-equivalence evaluator. In addition to the
-calibrated/strict exact ring-convolution operator metric, it reports physical
-and coordinate-diagnostic transform errors, best transforms, and twin gating
-columns. Strict-only metrics from lightweight blind sweeps should not be
-treated as the final physical-equivalence score.
+This is the primary gauge-aware full operator evaluator for Seidel recovery
+sweeps. In addition to calibrated/strict exact ring-convolution operator
+metrics, it reports physical-canonical and gauge-canonical transforms,
+operator errors, recovered RMS ratios, sign agreement, and twin gating columns.
+Strict-only metrics from lightweight blind sweeps should not be treated as the
+final physical-equivalence score.
 """
 
 from __future__ import annotations
@@ -353,7 +354,7 @@ def main() -> None:
     (args.output_dir / "README.md").write_text(
         "\n".join(
             [
-                "# Seidel Physical-Operator Evaluation",
+                "# Seidel Gauge-Aware Physical-Operator Evaluation",
                 "",
                 f"- Input CSV: `{args.input_csv}`",
                 f"- Output CSV: `{output_csv}`",
@@ -366,10 +367,18 @@ def main() -> None:
                 "evaluated on deterministic probes. PSF and complex OTF stack metrics "
                 "are diagnostic only.",
                 "",
-                "This post-hoc evaluator reports calibrated/strict, physical-equivalent, "
-                "and coordinate-diagnostic operator errors plus best transforms and twin "
-                "gating columns. Strict-only metrics from blind sweep triage should not "
-                "be interpreted as final physical-equivalence scores.",
+                "This primary evaluator reports calibrated/strict, physical-canonical, "
+                "and gauge-canonical operator errors plus best transforms, sign "
+                "agreement, recovered/GT RMS ratios, and twin gating columns. Sign "
+                "tables should use `canonical_sign_source=gauge` by default, while raw "
+                "and physical-canonical columns remain available for control checks.",
+                "",
+                "Gauge v1 uses the existing hard-coded discrete operator transforms: "
+                "`identity -> I`, `x_reflection -> mirror_x`, `y_reflection -> I`, "
+                "`rot180 -> mirror_x`, `phase_conjugate_twin -> twin`, and "
+                "`phase_conjugate_twin_mirror -> twin_mirror`. Continuous "
+                "image-space distortion warp, per-field recentering, and per-field "
+                "refocus are not enabled in the current forward model.",
                 "",
                 "Classical backend conventions are the default analysis path:",
                 "",

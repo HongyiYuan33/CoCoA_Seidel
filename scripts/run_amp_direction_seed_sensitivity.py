@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -351,7 +352,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seidel-rms-floor-pupil-samples", type=int, default=51)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--train-verbose", action="store_true")
+    parser.add_argument("--report-only", action="store_true")
+    parser.add_argument("--skip-operator-eval", action="store_true")
+    parser.add_argument("--operator-eval-dim", type=int, default=256)
+    parser.add_argument("--operator-eval-resume", action="store_true", default=True)
+    parser.add_argument("--operator-eval-dataset-twin-invariance-pass", default="auto")
     return parser.parse_args()
+
+
+def maybe_run_gauge_aware_operator_eval(args: argparse.Namespace, rows: list[dict[str, Any]]) -> None:
+    if args.skip_operator_eval:
+        print("[operator-eval] skipped by --skip-operator-eval", flush=True)
+        return
+    if args.num_shards > 1 and not args.report_only:
+        print(
+            "[operator-eval] skipped inside sharded training worker; rerun with "
+            "--report-only after all shards finish.",
+            flush=True,
+        )
+        return
+    input_csv = args.output_root / f"{args.run_name}_operator_input.csv"
+    eval_dir = args.output_root / args.run_name / f"gauge_aware_operator_eval_dim{int(args.operator_eval_dim)}"
+    cmd = [
+        sys.executable,
+        str(HERE / "run_gauge_aware_operator_eval_pipeline.py"),
+        str(input_csv),
+        str(eval_dir),
+        "--dim",
+        str(int(args.operator_eval_dim)),
+        "--dataset-twin-invariance-pass",
+        str(args.operator_eval_dataset_twin_invariance_pass),
+    ]
+    if args.operator_eval_resume:
+        cmd.append("--resume")
+    print(f"[operator-eval] input rows={len(rows)}", flush=True)
+    print("[operator-eval]", " ".join(cmd), flush=True)
+    subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=True)
 
 
 def main() -> None:
@@ -399,29 +435,30 @@ def main() -> None:
         flush=True,
     )
 
-    for seed, parameterization, rms_prior_measure, base_candidate in selected_cases:
-        if float(args.lambda_a) == 0.0:
-            suffix = f"no_RMS__{parameterization}"
-        else:
-            suffix = f"{rms_prior_measure}_RMS_prior__{parameterization}"
-        candidate = replace(
-            base_candidate,
-            candidate_id=f"{base_candidate.candidate_id}__{suffix}",
-        )
-        run_case(
-            output_root=args.output_root / args.run_name,
-            stage="stage3",
-            image=args.image,
-            candidate=candidate,
-            size=args.size,
-            pretrain_iter=args.pretrain_iter,
-            num_iter=args.num_iter,
-            seed=seed,
-            force=args.force,
-            train_verbose=args.train_verbose,
-            seidel_convention=args.seidel_convention,
-            sweep_args=make_sweep_args(args, parameterization, rms_prior_measure),
-        )
+    if not args.report_only:
+        for seed, parameterization, rms_prior_measure, base_candidate in selected_cases:
+            if float(args.lambda_a) == 0.0:
+                suffix = f"no_RMS__{parameterization}"
+            else:
+                suffix = f"{rms_prior_measure}_RMS_prior__{parameterization}"
+            candidate = replace(
+                base_candidate,
+                candidate_id=f"{base_candidate.candidate_id}__{suffix}",
+            )
+            run_case(
+                output_root=args.output_root / args.run_name,
+                stage="stage3",
+                image=args.image,
+                candidate=candidate,
+                size=args.size,
+                pretrain_iter=args.pretrain_iter,
+                num_iter=args.num_iter,
+                seed=seed,
+                force=args.force,
+                train_verbose=args.train_verbose,
+                seidel_convention=args.seidel_convention,
+                sweep_args=make_sweep_args(args, parameterization, rms_prior_measure),
+            )
 
     rows = build_eval_input(
         args.output_root,
@@ -429,6 +466,7 @@ def main() -> None:
         args.output_root / f"{args.run_name}_operator_input.csv",
     )
     write_raw_summary(rows, args.output_root / args.run_name / "raw_seed_summary.csv")
+    maybe_run_gauge_aware_operator_eval(args, rows)
     print(f"[seed-test] wrote input rows={len(rows)}", flush=True)
 
 

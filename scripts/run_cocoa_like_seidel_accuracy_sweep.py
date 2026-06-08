@@ -784,6 +784,48 @@ def generate_reports(output_root: Path, args: argparse.Namespace) -> None:
     write_best_candidates(output_root, args)
 
 
+def maybe_run_gauge_aware_operator_eval(output_root: Path, args: argparse.Namespace) -> None:
+    if args.skip_operator_eval:
+        print("[operator-eval] skipped by --skip-operator-eval", flush=True)
+        return
+    if args.num_shards > 1 and args.stage != "report":
+        print(
+            "[operator-eval] skipped inside sharded training worker; run --stage report "
+            "after all shards finish.",
+            flush=True,
+        )
+        return
+    stage_rows = collect_metrics(output_root, "stage3")
+    stage_name = "stage3"
+    if not stage_rows:
+        stage_rows = collect_metrics(output_root, "stage2")
+        stage_name = "stage2"
+    if not stage_rows:
+        stage_rows = collect_metrics(output_root, "stage1")
+        stage_name = "stage1"
+    if not stage_rows:
+        print("[operator-eval] skipped because no completed metric rows were found", flush=True)
+        return
+    input_csv = output_root / f"{stage_name}_operator_input.csv"
+    write_csv(stage_rows, input_csv)
+    eval_dir = output_root / f"gauge_aware_operator_eval_{stage_name}_dim{int(args.operator_eval_dim)}"
+    cmd = [
+        sys.executable,
+        str(HERE / "run_gauge_aware_operator_eval_pipeline.py"),
+        str(input_csv),
+        str(eval_dir),
+        "--dim",
+        str(int(args.operator_eval_dim)),
+        "--dataset-twin-invariance-pass",
+        str(args.operator_eval_dataset_twin_invariance_pass),
+    ]
+    if args.operator_eval_resume:
+        cmd.append("--resume")
+    print(f"[operator-eval] {stage_name} input rows={len(stage_rows)}", flush=True)
+    print("[operator-eval]", " ".join(cmd), flush=True)
+    subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=True)
+
+
 def run_stage1_case_subprocess(
     output_root: Path,
     args: argparse.Namespace,
@@ -988,6 +1030,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-report", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--skip-config-write", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--skip-operator-eval", action="store_true")
+    parser.add_argument("--operator-eval-dim", type=int, default=256)
+    parser.add_argument("--operator-eval-resume", action="store_true", default=True)
+    parser.add_argument("--operator-eval-dataset-twin-invariance-pass", default="auto")
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--min-object-ssim", type=float, default=0.50)
@@ -1188,6 +1234,8 @@ def main() -> None:
             generate_reports(output_root, args)
     if args.stage == "report":
         generate_reports(output_root, args)
+    if not args.skip_report and args.stage in {"all", "stage3", "report"}:
+        maybe_run_gauge_aware_operator_eval(output_root, args)
     print(f"[done] sweep root: {output_root}", flush=True)
 
 

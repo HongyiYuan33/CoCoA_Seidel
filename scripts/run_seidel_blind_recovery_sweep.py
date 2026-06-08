@@ -5,10 +5,10 @@ RDM forward model.  Current defaults use the classical backend coefficient
 family and synthesize measurements directly from backend-6D Seidel vectors.
 
 This runner reports strict/calibrated operator diagnostics directly from
-``RingOperatorProbeEvaluator`` for sweep triage. Use
-``evaluate_seidel_physical_operator_sweep.py`` for the post-hoc
-physical-equivalence metrics, coordinate diagnostics, and twin gating columns;
-strict-only metrics are not the final physical-equivalence score.
+``RingOperatorProbeEvaluator`` for sweep triage. Completed sweeps also feed the
+primary gauge-aware operator evaluator, which reports physical-canonical and
+gauge-canonical metrics/sign agreement; strict-only metrics are not the final
+physical-equivalence score.
 
 ``trace5``/``trace4``/``trace3`` helpers remain in this module only for
 internal reproduction of paused trace-separated experiments; the primary CLI
@@ -22,6 +22,7 @@ import csv
 import datetime as dt
 import json
 import math
+import subprocess
 import sys
 import time
 import traceback
@@ -801,6 +802,63 @@ def write_summary(output_root: Path, args: argparse.Namespace, rows: list[dict[s
     write_json_atomic(output_root / "blind_recovery_summary.json", summary)
 
 
+def operator_eval_input_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        model = str(row.get("model_name") or row.get("theta_convention") or "")
+        if row.get("status") != "success" or model not in CLASSICAL_MODELS:
+            continue
+        gt = row.get("theta_gt_backend6") or row.get("seidel_gt")
+        hat = row.get("theta_hat_backend6") or row.get("seidel_final")
+        if gt in (None, "") or hat in (None, ""):
+            continue
+        item = dict(row)
+        item["seidel_convention"] = model
+        item["seidel_gt"] = gt
+        item["seidel_final"] = hat
+        out.append(item)
+    return out
+
+
+def maybe_run_gauge_aware_operator_eval(
+    output_root: Path,
+    args: argparse.Namespace,
+    rows: list[dict[str, Any]],
+) -> None:
+    if args.skip_operator_eval:
+        print("[operator-eval] skipped by --skip-operator-eval", flush=True)
+        return
+    if int(args.num_shards) > 1 and not args.aggregate_only:
+        print(
+            "[operator-eval] skipped inside sharded training worker; run "
+            "--aggregate-only after all shards finish.",
+            flush=True,
+        )
+        return
+    input_rows = operator_eval_input_rows(rows)
+    if not input_rows:
+        print("[operator-eval] skipped because no successful classical rows were found", flush=True)
+        return
+    input_csv = output_root / "blind_recovery_operator_input.csv"
+    write_csv_atomic(input_rows, input_csv)
+    eval_dir = output_root / f"gauge_aware_operator_eval_dim{int(args.dim)}"
+    cmd = [
+        sys.executable,
+        str(HERE / "run_gauge_aware_operator_eval_pipeline.py"),
+        str(input_csv),
+        str(eval_dir),
+        "--dim",
+        str(int(args.dim)),
+        "--dataset-twin-invariance-pass",
+        str(args.operator_eval_dataset_twin_invariance_pass),
+    ]
+    if args.operator_eval_resume:
+        cmd.append("--resume")
+    print(f"[operator-eval] input rows={len(input_rows)}", flush=True)
+    print("[operator-eval]", " ".join(cmd), flush=True)
+    subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=True)
+
+
 def run_sweep(args: argparse.Namespace) -> list[dict[str, Any]]:
     output_root = Path(args.output_root)
     cases = build_cases(args)
@@ -810,6 +868,7 @@ def run_sweep(args: argparse.Namespace) -> list[dict[str, Any]]:
         write_summary(output_root, args, rows)
         if not args.no_plots:
             make_plots(rows, output_root)
+        maybe_run_gauge_aware_operator_eval(output_root, args, rows)
         print(json.dumps({"aggregate_only": True, "num_completed_cases": len(rows)}, indent=2))
         return rows
     if args.dry_run:
@@ -834,6 +893,9 @@ def run_sweep(args: argparse.Namespace) -> list[dict[str, Any]]:
             write_summary(output_root, args, completed)
             if not args.no_plots:
                 make_plots(completed, output_root)
+    if not args.skip_aggregate:
+        completed = collect_completed(output_root)
+        maybe_run_gauge_aware_operator_eval(output_root, args, completed)
     return rows
 
 
@@ -898,6 +960,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-aggregate", action="store_true")
     parser.add_argument("--aggregate-only", action="store_true")
     parser.add_argument("--no-plots", action="store_true")
+    parser.add_argument("--skip-operator-eval", action="store_true")
+    parser.add_argument("--operator-eval-resume", action="store_true", default=True)
+    parser.add_argument("--operator-eval-dataset-twin-invariance-pass", default="auto")
     parser.add_argument("--train-verbose", action="store_true")
     return cocoa.normalize_nerf_capacity_args(parser, parser.parse_args(argv))
 
