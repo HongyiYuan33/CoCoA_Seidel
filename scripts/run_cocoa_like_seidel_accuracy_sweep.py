@@ -46,6 +46,9 @@ DIRECTIONS = {
 STAGE1 = {"size": 128, "pretrain_iter": 200, "num_iter": 500}
 STAGE2 = {"size": 256, "pretrain_iter": 400, "num_iter": 1000}
 STAGE3 = {"size": 256, "pretrain_iter": 400, "num_iter": 1000}
+COEFF_NAMES = ["W040", "W131", "W222", "W220", "W311", "Wd"]
+COEFF_INDEX = {name: idx for idx, name in enumerate(COEFF_NAMES)}
+DEFAULT_SINGLE_COEFF_VALUES = [0.1, 0.2, 0.4, -0.1, -0.2, -0.4]
 
 
 @dataclass(frozen=True)
@@ -55,16 +58,43 @@ class Candidate:
     target_rms: float
     seidel: np.ndarray
     actual_rms: float
+    active_seidel_index: int | None = None
+    active_seidel_name: str | None = None
+    active_seidel_value: float | None = None
+    fixed_seidel_indices: tuple[int, ...] | None = None
+    candidate_mode: str = "direction"
 
 
 def tag_float(value: float) -> str:
-    return f"{value:.3f}".rstrip("0").rstrip(".").replace(".", "p")
+    return f"{value:.3f}".rstrip("0").rstrip(".").replace(".", "p").replace("-", "m")
 
 
 def parse_float_list(values: Iterable[str] | None, defaults: list[float]) -> list[float]:
     if values is None:
         return list(defaults)
     return [float(v) for v in values]
+
+
+def parse_coefficient_names(values: Iterable[str] | None) -> list[str]:
+    if values is None:
+        return list(COEFF_NAMES)
+    names: list[str] = []
+    for raw in values:
+        text = str(raw).strip()
+        if text.isdigit():
+            idx = int(text)
+            if idx < 0 or idx >= len(COEFF_NAMES):
+                raise ValueError(f"Coefficient index must be in [0, 5], got {idx}")
+            name = COEFF_NAMES[idx]
+        else:
+            if text not in COEFF_INDEX:
+                raise ValueError(
+                    f"Unknown coefficient {text!r}; expected one of {COEFF_NAMES}"
+                )
+            name = text
+        if name not in names:
+            names.append(name)
+    return names
 
 
 def get_pupil_grid(n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -114,7 +144,19 @@ def make_candidates(
     strengths: list[float],
     *,
     seidel_convention: str = "backend6",
+    candidate_mode: str = "direction",
+    coefficients: list[str] | None = None,
+    coefficient_values: list[float] | None = None,
 ) -> list[Candidate]:
+    if candidate_mode == "single_coeff":
+        return make_single_coeff_candidates(
+            coefficients=coefficients,
+            coefficient_values=coefficient_values,
+            seidel_convention=seidel_convention,
+        )
+    if candidate_mode != "direction":
+        raise ValueError(f"Unknown candidate_mode={candidate_mode!r}")
+
     candidates: list[Candidate] = []
     fixed = cocoa.fixed_seidel_indices_for_convention(seidel_convention)
     for direction in directions:
@@ -136,6 +178,42 @@ def make_candidates(
                     target_rms=float(target),
                     seidel=seidel.astype(np.float32),
                     actual_rms=actual,
+                )
+            )
+    return candidates
+
+
+def make_single_coeff_candidates(
+    *,
+    coefficients: list[str] | None,
+    coefficient_values: list[float] | None,
+    seidel_convention: str,
+) -> list[Candidate]:
+    if seidel_convention != "classical6d":
+        raise ValueError("--candidate-mode single_coeff requires --seidel-convention classical6d")
+    names = parse_coefficient_names(coefficients)
+    values = list(coefficient_values or DEFAULT_SINGLE_COEFF_VALUES)
+    candidates: list[Candidate] = []
+    for name in names:
+        active_idx = COEFF_INDEX[name]
+        fixed = tuple(idx for idx in range(6) if idx != active_idx)
+        for value in values:
+            seidel = np.zeros(6, dtype=np.float32)
+            seidel[active_idx] = float(value)
+            actual = field_weighted_wavefront_rms(seidel)
+            candidate_id = f"{name}__coef{tag_float(float(value))}"
+            candidates.append(
+                Candidate(
+                    candidate_id=candidate_id,
+                    direction=name,
+                    target_rms=actual,
+                    seidel=seidel,
+                    actual_rms=actual,
+                    active_seidel_index=active_idx,
+                    active_seidel_name=name,
+                    active_seidel_value=float(value),
+                    fixed_seidel_indices=fixed,
+                    candidate_mode="single_coeff",
                 )
             )
     return candidates
@@ -163,6 +241,20 @@ def case_metrics_path(
     return case_dir / "joint" / "metrics.json"
 
 
+def write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    tmp.replace(path)
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
 def run_args_for_case(
     *,
     image: str,
@@ -175,6 +267,14 @@ def run_args_for_case(
     seidel_convention: str,
     sweep_args: argparse.Namespace,
 ) -> SimpleNamespace:
+    fixed_override = (
+        list(candidate.fixed_seidel_indices)
+        if candidate.fixed_seidel_indices is not None
+        else None
+    )
+    defocus_anchor_weight = sweep_args.defocus_anchor_weight
+    if candidate.active_seidel_index == 5:
+        defocus_anchor_weight = 0.0
     return SimpleNamespace(
         image=image,
         size=size,
@@ -187,7 +287,7 @@ def run_args_for_case(
         rsd_weight=sweep_args.rsd_weight,
         tv_weight=sweep_args.tv_weight,
         pretrain_scalar=sweep_args.pretrain_scalar,
-        defocus_anchor_weight=sweep_args.defocus_anchor_weight,
+        defocus_anchor_weight=defocus_anchor_weight,
         defocus_index=sweep_args.defocus_index,
         seidel_rms_floor_weight=sweep_args.seidel_rms_floor_weight,
         seidel_rms_floor_alpha=sweep_args.seidel_rms_floor_alpha,
@@ -209,6 +309,7 @@ def run_args_for_case(
         gt_seidel_json=json.dumps(candidate.seidel.astype(float).tolist()),
         gt_label=candidate.candidate_id,
         gt_source="custom",
+        fixed_seidel_indices_override=fixed_override,
         seed=seed,
         verbose=train_verbose,
     )
@@ -234,6 +335,35 @@ def augment_metrics(
     gt_hf = float(metrics.get("gt_hf_ratio", 0.0))
     meas_hf = float(metrics.get("measurement_hf_ratio", 0.0))
     config = metrics.get("config", {})
+    fixed = (
+        list(candidate.fixed_seidel_indices)
+        if candidate.fixed_seidel_indices is not None
+        else cocoa.fixed_seidel_indices_for_convention(seidel_convention)
+    )
+    active_idx = candidate.active_seidel_index
+    active_fields: dict[str, float | int | str | None] = {
+        "candidate_mode": candidate.candidate_mode,
+        "active_seidel_index": active_idx,
+        "active_seidel_name": candidate.active_seidel_name,
+        "active_seidel_value": candidate.active_seidel_value,
+    }
+    if active_idx is not None:
+        non_active = [idx for idx in range(len(rec)) if idx != int(active_idx)]
+        active_gt = float(gt[int(active_idx)])
+        active_rec = float(rec[int(active_idx)])
+        leakage = rec[non_active] if non_active else np.asarray([], dtype=np.float64)
+        active_fields.update(
+            {
+                "active_seidel_gt": active_gt,
+                "active_seidel_final": active_rec,
+                "active_seidel_error": active_rec - active_gt,
+                "active_seidel_abs_error": abs(active_rec - active_gt),
+                "non_active_seidel_l2_leakage": float(np.linalg.norm(leakage)),
+                "non_active_seidel_max_abs_leakage": (
+                    float(np.max(np.abs(leakage))) if leakage.size else 0.0
+                ),
+            }
+        )
     metrics.update(
         {
             "stage": stage,
@@ -256,7 +386,8 @@ def augment_metrics(
             "seidel_rms_floor_alpha": float(config.get("seidel_rms_floor_alpha", 0.8)),
             "seidel_rms_floor_target": config.get("seidel_rms_floor_target"),
             "wavefront_recovered_over_gt_rms": rec_rms / max(gt_rms, 1e-12),
-            **cocoa.convention_metadata(seidel_convention),
+            **active_fields,
+            **cocoa.metadata_with_fixed_indices(seidel_convention, fixed),
         }
     )
     return metrics
@@ -281,6 +412,8 @@ def run_case(
     case_dir = metrics_path.parents[1]
     if metrics_path.is_file() and not force:
         metrics = json.loads(metrics_path.read_text())
+        if metrics.get("sweep_case_complete") is True:
+            return metrics
         if "relative_wavefront_error" not in metrics or "fixed_seidel_indices" not in metrics:
             metrics = augment_metrics(
                 metrics,
@@ -290,8 +423,6 @@ def run_case(
                 seed=seed,
                 seidel_convention=seidel_convention,
             )
-            metrics_path.write_text(json.dumps(metrics, indent=2))
-        return metrics
 
     case_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -333,19 +464,18 @@ def run_case(
         seed=seed,
         seidel_convention=seidel_convention,
     )
-    metrics_path.write_text(json.dumps(metrics, indent=2))
     cocoa.save_summary_figure(case_dir, sharp_gt, meas_gt, [("joint", result, metrics)])
-    (case_dir / "summary.json").write_text(
-        json.dumps(
-            {
-                "stage": stage,
-                "image": image,
-                "seed": seed,
-                "candidate": candidate.__dict__ | {"seidel": candidate.seidel.tolist()},
-                "metrics_path": str(metrics_path),
-            },
-            indent=2,
-        )
+    metrics["sweep_case_complete"] = True
+    write_json_atomic(metrics_path, metrics)
+    write_json_atomic(
+        case_dir / "summary.json",
+        {
+            "stage": stage,
+            "image": image,
+            "seed": seed,
+            "candidate": candidate.__dict__ | {"seidel": candidate.seidel.tolist()},
+            "metrics_path": str(metrics_path),
+        },
     )
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     return metrics
@@ -363,15 +493,28 @@ def collect_metrics(output_root: Path, stage: str) -> list[dict]:
 
 def write_csv(rows: list[dict], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
     if not rows:
-        path.write_text("")
+        tmp.write_text("")
+        tmp.replace(path)
         return
     preferred = [
         "stage",
         "image",
         "seed",
         "candidate_id",
+        "candidate_mode",
         "direction",
+        "active_seidel_index",
+        "active_seidel_name",
+        "active_seidel_value",
+        "active_seidel_gt",
+        "active_seidel_final",
+        "active_seidel_error",
+        "active_seidel_abs_error",
+        "non_active_seidel_l2_leakage",
+        "non_active_seidel_max_abs_leakage",
+        "fixed_seidel_indices",
         "target_wavefront_rms",
         "actual_wavefront_rms",
         "wavefront_gt_rms",
@@ -400,17 +543,18 @@ def write_csv(rows: list[dict], path: Path) -> None:
     ]
     extra = sorted({k for row in rows for k in row if k not in preferred and not isinstance(row.get(k), (dict, list))})
     fieldnames = [k for k in preferred if any(k in row for row in rows)] + extra
-    with path.open("w", newline="") as f:
+    with tmp.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
             out = {}
             for key in fieldnames:
                 value = row.get(key)
-                if isinstance(value, (list, dict)):
+                if isinstance(value, (list, dict, tuple)):
                     value = json.dumps(value)
                 out[key] = value
             writer.writerow(out)
+    tmp.replace(path)
 
 
 def mean_metric(rows: list[dict], key: str) -> float:
@@ -458,6 +602,118 @@ def candidate_summary(rows: list[dict], *, images: list[str], min_object_ssim: f
         )
     summaries.sort(key=lambda r: (r["mean_relative_wavefront_error"], r["max_relative_wavefront_error"]))
     return summaries
+
+
+def single_coeff_summary(rows: list[dict]) -> list[dict]:
+    groups = sorted(
+        {
+            (
+                int(row["active_seidel_index"]),
+                str(row["active_seidel_name"]),
+                float(row["active_seidel_value"]),
+            )
+            for row in rows
+            if row.get("candidate_mode") == "single_coeff"
+            and row.get("active_seidel_index") is not None
+        },
+        key=lambda item: (item[0], item[2]),
+    )
+    out: list[dict] = []
+    for active_idx, active_name, active_value in groups:
+        group = [
+            row
+            for row in rows
+            if row.get("candidate_mode") == "single_coeff"
+            and int(row["active_seidel_index"]) == active_idx
+            and float(row["active_seidel_value"]) == active_value
+        ]
+        rel = np.asarray([float(row["relative_wavefront_error"]) for row in group], dtype=np.float64)
+        active_abs = np.asarray([float(row["active_seidel_abs_error"]) for row in group], dtype=np.float64)
+        leakage = np.asarray([float(row["non_active_seidel_l2_leakage"]) for row in group], dtype=np.float64)
+        ssim = np.asarray([float(row["ssim_recon_gain_vs_gt"]) for row in group], dtype=np.float64)
+        nrmse = np.asarray([float(row["nrmse_recon_gain_vs_gt"]) for row in group], dtype=np.float64)
+        out.append(
+            {
+                "active_seidel_index": active_idx,
+                "active_seidel_name": active_name,
+                "active_seidel_value": active_value,
+                "candidate_id": group[0]["candidate_id"],
+                "num_runs": len(group),
+                "images": ",".join(sorted({str(row["image"]) for row in group})),
+                "mean_relative_wavefront_error": float(np.mean(rel)),
+                "median_relative_wavefront_error": float(np.median(rel)),
+                "max_relative_wavefront_error": float(np.max(rel)),
+                "mean_active_seidel_abs_error": float(np.mean(active_abs)),
+                "max_active_seidel_abs_error": float(np.max(active_abs)),
+                "mean_non_active_seidel_l2_leakage": float(np.mean(leakage)),
+                "max_non_active_seidel_l2_leakage": float(np.max(leakage)),
+                "mean_ssim": float(np.mean(ssim)),
+                "mean_nrmse": float(np.mean(nrmse)),
+            }
+        )
+    return out
+
+
+def write_single_coeff_summary(output_root: Path, rows: list[dict]) -> None:
+    summary = single_coeff_summary(rows)
+    if not summary:
+        return
+    write_csv(summary, output_root / "single_coeff_summary.csv")
+    lines = ["# Single-Coefficient Recovery Summary", ""]
+    lines.append(
+        "| coefficient | value | runs | mean rel WF err | mean active abs err | "
+        "mean non-active L2 leakage | mean SSIM |"
+    )
+    lines.append("|---|---:|---:|---:|---:|---:|---:|")
+    for row in summary:
+        lines.append(
+            f"| {row['active_seidel_name']} | {row['active_seidel_value']:.3g} | "
+            f"{row['num_runs']} | {row['mean_relative_wavefront_error']:.4f} | "
+            f"{row['mean_active_seidel_abs_error']:.4g} | "
+            f"{row['mean_non_active_seidel_l2_leakage']:.4g} | "
+            f"{row['mean_ssim']:.4f} |"
+        )
+    lines.append("")
+    write_text_atomic(output_root / "single_coeff_summary.md", "\n".join(lines))
+
+
+def run_single_coeff_operator_eval(output_root: Path, rows: list[dict], args: argparse.Namespace) -> None:
+    single_rows = [
+        row
+        for row in rows
+        if row.get("candidate_mode") == "single_coeff"
+        and row.get("active_seidel_index") is not None
+    ]
+    if not single_rows:
+        return
+    dim = int(single_rows[0].get("size") or args.stage1_size)
+    input_dir = output_root / "single_coeff_operator_eval_inputs"
+    for active_name in COEFF_NAMES:
+        group = [row for row in single_rows if row.get("active_seidel_name") == active_name]
+        if not group:
+            continue
+        active_idx = COEFF_INDEX[active_name]
+        fixed = [str(idx) for idx in range(6) if idx != active_idx]
+        input_csv = input_dir / f"{active_name}.csv"
+        eval_dir = output_root / f"single_coeff_operator_eval_{active_name}_dim{dim}"
+        write_csv(group, input_csv)
+        cmd = [
+            sys.executable,
+            str(HERE / "evaluate_seidel_physical_operator_sweep.py"),
+            str(input_csv),
+            str(eval_dir),
+            "--dim",
+            str(dim),
+            "--theta-convention",
+            "classical6d",
+            "--fixed-indices",
+            *fixed,
+            "--dataset-twin-invariance-pass",
+            args.dataset_twin_invariance_pass,
+            "--resume",
+        ]
+        print(f"[operator-eval] {active_name} fixed={fixed}", flush=True)
+        subprocess.run(cmd, cwd=PROJECT_ROOT, check=True)
 
 
 def summarize_stability_group(rows: list[dict], *, image: str) -> dict:
@@ -724,6 +980,7 @@ def generate_reports(output_root: Path, args: argparse.Namespace) -> None:
     write_csv(stage2, output_root / "stage2_metrics.csv")
     write_csv(stage3, output_root / "stage3_metrics_raw.csv")
     write_csv(stage3_stability_rows(stage3, args.images), output_root / "stage3_seed_stability.csv")
+    write_single_coeff_summary(output_root, stage1)
     if stage1:
         plot_heatmap(stage1, output_root, args.images)
         plot_scatter(stage1, output_root)
@@ -733,6 +990,8 @@ def generate_reports(output_root: Path, args: argparse.Namespace) -> None:
         top_candidates = [row["candidate_id"] for row in summaries[:3]]
         plot_overview(output_root, overview_rows, args.images, top_candidates)
     write_best_candidates(output_root, args)
+    if args.run_operator_eval:
+        run_single_coeff_operator_eval(output_root, stage1, args)
 
 
 def run_stage1_case_subprocess(
@@ -744,8 +1003,14 @@ def run_stage1_case_subprocess(
 ) -> None:
     metrics_path = case_metrics_path(output_root, "stage1", image, candidate.candidate_id)
     if metrics_path.is_file() and not args.force:
-        print(f"[skip-subprocess] stage1 image={image} candidate={candidate.candidate_id}", flush=True)
-        return
+        try:
+            metrics = json.loads(metrics_path.read_text())
+        except Exception:
+            metrics = {}
+        if metrics.get("sweep_case_complete") is True:
+            print(f"[skip-subprocess] stage1 image={image} candidate={candidate.candidate_id}", flush=True)
+            return
+        print(f"[rerun-subprocess] incomplete marker stage1 image={image} candidate={candidate.candidate_id}", flush=True)
 
     cmd = [
         sys.executable,
@@ -756,10 +1021,8 @@ def run_stage1_case_subprocess(
         "stage1",
         "--images",
         image,
-        "--directions",
-        candidate.direction,
-        "--strengths",
-        f"{candidate.target_rms:.12g}",
+        "--candidate-mode",
+        args.candidate_mode,
         "--seidel-convention",
         args.seidel_convention,
         "--stage1-size",
@@ -813,6 +1076,26 @@ def run_stage1_case_subprocess(
         "--skip-report",
         "--skip-config-write",
     ]
+    if candidate.candidate_mode == "single_coeff":
+        assert candidate.active_seidel_name is not None
+        assert candidate.active_seidel_value is not None
+        cmd.extend(
+            [
+                "--coefficients",
+                candidate.active_seidel_name,
+                "--coefficient-values",
+                f"{candidate.active_seidel_value:.12g}",
+            ]
+        )
+    else:
+        cmd.extend(
+            [
+                "--directions",
+                candidate.direction,
+                "--strengths",
+                f"{candidate.target_rms:.12g}",
+            ]
+        )
     if args.force:
         cmd.append("--force")
     if args.train_verbose:
@@ -898,13 +1181,26 @@ def run_stage3(output_root: Path, args: argparse.Namespace, candidates: list[Can
     return selected
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--stage", choices=["all", "stage1", "stage2", "stage3", "report"], default="all")
     parser.add_argument("--images", nargs="+", choices=sorted(cocoa.IMAGE_PATHS), default=IMAGES)
+    parser.add_argument("--candidate-mode", choices=["direction", "single_coeff"], default="direction")
     parser.add_argument("--directions", nargs="+", choices=sorted(DIRECTIONS), default=list(DIRECTIONS))
     parser.add_argument("--strengths", nargs="+", default=[str(v) for v in STRENGTHS])
+    parser.add_argument(
+        "--coefficients",
+        nargs="+",
+        default=None,
+        help="Single-coeff mode coefficient names or indices. Defaults to all backend-6 coefficients.",
+    )
+    parser.add_argument(
+        "--coefficient-values",
+        nargs="+",
+        default=None,
+        help="Direct coefficient values for --candidate-mode single_coeff.",
+    )
     parser.add_argument(
         "--seidel-convention",
         choices=list(cocoa.CLASSICAL_CONVENTIONS),
@@ -923,6 +1219,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-report", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--skip-config-write", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--run-operator-eval", action="store_true")
+    parser.add_argument(
+        "--dataset-twin-invariance-pass",
+        choices=["auto", "true", "false"],
+        default="auto",
+    )
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--min-object-ssim", type=float, default=0.50)
@@ -977,10 +1279,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seidel-rms-floor-field-samples", type=int, default=21)
     parser.add_argument("--seidel-rms-floor-pupil-samples", type=int, default=51)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     args.scheduler = None if args.scheduler == "none" else args.scheduler
     args.nerf_skips = cocoa.parse_nerf_skips(args.nerf_skips)
     args.strengths = parse_float_list(args.strengths, STRENGTHS)
+    args.coefficient_values = parse_float_list(args.coefficient_values, DEFAULT_SINGLE_COEFF_VALUES)
+    try:
+        args.coefficients = parse_coefficient_names(args.coefficients)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.candidate_mode == "single_coeff" and args.seidel_convention != "classical6d":
+        parser.error("--candidate-mode single_coeff requires --seidel-convention classical6d")
     if args.seidel_rms_floor_weight < 0.0:
         raise ValueError("--seidel-rms-floor-weight must be non-negative")
     if args.seidel_rms_floor_alpha < 0.0:
@@ -1000,25 +1309,29 @@ def parse_args() -> argparse.Namespace:
 
 
 def write_sweep_config(output_root: Path, args: argparse.Namespace, candidates: list[Candidate]) -> None:
-    (output_root / "sweep_config.json").write_text(
-        json.dumps(
-            {
-                "args": vars(args),
-                **cocoa.convention_metadata(args.seidel_convention),
-                "directions": DIRECTIONS,
-                "candidates": [
-                    {
-                        "candidate_id": candidate.candidate_id,
-                        "direction": candidate.direction,
-                        "target_rms": candidate.target_rms,
-                        "actual_rms": candidate.actual_rms,
-                        "seidel": candidate.seidel.tolist(),
-                    }
-                    for candidate in candidates
-                ],
-            },
-            indent=2,
-        )
+    write_json_atomic(
+        output_root / "sweep_config.json",
+        {
+            "args": vars(args),
+            **cocoa.convention_metadata(args.seidel_convention),
+            "directions": DIRECTIONS,
+            "coefficient_names": COEFF_NAMES,
+            "candidates": [
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "candidate_mode": candidate.candidate_mode,
+                    "direction": candidate.direction,
+                    "target_rms": candidate.target_rms,
+                    "actual_rms": candidate.actual_rms,
+                    "active_seidel_index": candidate.active_seidel_index,
+                    "active_seidel_name": candidate.active_seidel_name,
+                    "active_seidel_value": candidate.active_seidel_value,
+                    "fixed_seidel_indices": list(candidate.fixed_seidel_indices or ()),
+                    "seidel": candidate.seidel.tolist(),
+                }
+                for candidate in candidates
+            ],
+        },
     )
 
 
@@ -1028,6 +1341,9 @@ def main() -> None:
         args.directions,
         args.strengths,
         seidel_convention=args.seidel_convention,
+        candidate_mode=args.candidate_mode,
+        coefficients=args.coefficients,
+        coefficient_values=args.coefficient_values,
     )
     output_root = cocoa.PROJECT_ROOT / "outputs" / "cocoa_like_2d_mechanism" / args.run_name
     output_root.mkdir(parents=True, exist_ok=True)

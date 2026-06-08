@@ -190,6 +190,37 @@ def convention_metadata(convention: str) -> dict[str, Any]:
     raise ValueError(f"Unknown seidel convention {convention!r}")
 
 
+def metadata_with_fixed_indices(convention: str, fixed_indices: Sequence[int] | None = None) -> dict[str, Any]:
+    """Convention metadata, with an optional per-run fixed-index override."""
+
+    metadata = convention_metadata(convention)
+    if fixed_indices is None:
+        return metadata
+    fixed = sorted({int(idx) for idx in fixed_indices})
+    metadata.update(
+        {
+            "fixed_seidel_indices": fixed,
+            "no_defocus": 5 in fixed,
+            "no_w311_no_defocus": 4 in fixed and 5 in fixed,
+            "distortion_forward_model": (
+                "disabled_W311_zero" if 4 in fixed else "backend_W311"
+            ),
+        }
+    )
+    return metadata
+
+
+def resolved_fixed_seidel_indices(args: argparse.Namespace) -> list[int]:
+    """Return actual backend indices fixed for this run."""
+
+    override = getattr(args, "fixed_seidel_indices_override", None)
+    if override is not None:
+        return sorted({int(idx) for idx in override})
+    if trace_model_dim(args.seidel_convention) is not None:
+        return []
+    return fixed_seidel_indices_for_convention(args.seidel_convention)
+
+
 def parse_seidel_json(raw: str, *, convention: str) -> np.ndarray:
     """Parse a custom Seidel vector from JSON/list text."""
 
@@ -832,7 +863,10 @@ def compute_metrics(
         "gt_label": args.gt_label,
         "gt_source": args.gt_source,
         "seidel_convention": args.seidel_convention,
-        **convention_metadata(args.seidel_convention),
+        **metadata_with_fixed_indices(
+            args.seidel_convention,
+            resolved_fixed_seidel_indices(args),
+        ),
         "elapsed_s": result.elapsed_s,
         "final_loss": float(result.loss_history[-1]),
         "final_ssim_loss": float(result.ssim_history[-1]),
@@ -1067,11 +1101,7 @@ def run_one_mode(
         defocus_anchor_weight=args.defocus_anchor_weight,
         defocus_index=args.defocus_index,
         seidel_model_dim=trace_model_dim(args.seidel_convention),
-        fixed_seidel_indices=(
-            fixed_seidel_indices_for_convention(args.seidel_convention)
-            if trace_model_dim(args.seidel_convention) is None
-            else []
-        ),
+        fixed_seidel_indices=resolved_fixed_seidel_indices(args),
         scheduler=args.scheduler,
         eta_min_ratio=args.eta_min_ratio,
         seidel_rms_floor_weight=args.seidel_rms_floor_weight,
@@ -1191,6 +1221,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Trace-separated trace5/trace4/trace3 are paused internal helpers "
             "and are not exposed by this primary CLI."
         ),
+    )
+    ap.add_argument(
+        "--fixed-seidel-indices-override",
+        nargs="*",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     ap.add_argument(
         "--gt-label",
