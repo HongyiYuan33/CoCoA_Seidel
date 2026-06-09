@@ -3,6 +3,12 @@
 This manifest maps the organized symlink names in `experiments/` back to the
 original directories. Original paths are preserved.
 
+## Reusable Model Setups
+
+| Setup name | Preset file | Canonical run | Notes |
+|---|---|---|---|
+| `Seidel4D-TunedAdam-256-v1` | `00_catalog/model_setups/Seidel4D-TunedAdam-256-v1.md` and `00_catalog/model_setups/Seidel4D-TunedAdam-256-v1.json` | `outputs/cocoa_like_2d_mechanism/capacity4d_dirrms_tunedprior_size256_four_images_20260607__baseline` | Search aliases: `S4D-TunedAdam256`, `capacity4d-baseline-adam`, `4d-consistent-adam-baseline`. This is the tuned, 4D-consistent Adam baseline with `classical4d`, size256, MLP `6x128`, Fourier `60x7`, `max_val=20`, `nerf_beta=5`, and `rsd_weight=1e-3`. |
+
 ## 01 Baseline CoCoA-Like 2D
 
 | Organized entry | Original path | Notes |

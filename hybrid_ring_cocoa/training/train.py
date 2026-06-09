@@ -96,6 +96,7 @@ def train(
     num_iter: int = 500,
     lr_obj: float = 5e-3,
     lr_seidel: float = 1e-2,
+    seidel_optimizer: str = "adam",
     ssim_weight: float = 1.0,
     tv_weight: float = 1e-5,
     defocus_anchor_weight: float = 1.0,
@@ -123,6 +124,10 @@ def train(
         Number of joint-optimisation steps.
     lr_obj, lr_seidel : float
         Learning rates for the two parameter groups.
+    seidel_optimizer : {"adam", "sgd"}
+        Optimizer for trainable Seidel coefficients.  The object MLP always
+        uses Adam; ``"adam"`` preserves the historical shared-Adam path, while
+        ``"sgd"`` uses plain SGD with ``momentum=0`` for Seidel coefficients.
     ssim_weight, tv_weight, defocus_anchor_weight : float
         Loss weights.  ``tv_weight`` scales a summed (not mean) TV, so
         1e-5 is a reasonable starting point for a 128×128 image in ``[0, 1]``.
@@ -167,21 +172,31 @@ def train(
             net_obj, measurement_gt, num_iter=pretrain_iter, verbose=verbose
         )
 
-    optimizer = torch.optim.Adam(
-        [
-            {"params": net_obj.parameters(), "lr": lr_obj},
-            {"params": [seidel_coeffs], "lr": lr_seidel},
-        ],
-        betas=(0.9, 0.999),
-        eps=1e-8,
-    )
-    lr_scheduler = (
-        CosineAnnealingLR(
-            optimizer, T_max=num_iter, eta_min=lr_seidel * eta_min_ratio
-        )
-        if scheduler == "cosine"
-        else None
-    )
+    seidel_optimizer = str(seidel_optimizer).lower()
+    if seidel_optimizer not in {"adam", "sgd"}:
+        raise ValueError(f"Unsupported seidel_optimizer={seidel_optimizer!r}")
+
+    eta_min = lr_seidel * eta_min_ratio
+    optimizers: list[torch.optim.Optimizer] = []
+    lr_schedulers: list[CosineAnnealingLR] = []
+    if seidel_optimizer == "adam":
+        param_groups: list[dict] = [{"params": net_obj.parameters(), "lr": lr_obj}]
+        if seidel_coeffs.requires_grad:
+            param_groups.append({"params": [seidel_coeffs], "lr": lr_seidel})
+        optimizer = torch.optim.Adam(param_groups, betas=(0.9, 0.999), eps=1e-8)
+        optimizers.append(optimizer)
+        if scheduler == "cosine":
+            lr_schedulers.append(CosineAnnealingLR(optimizer, T_max=num_iter, eta_min=eta_min))
+    else:
+        obj_optimizer = torch.optim.Adam(net_obj.parameters(), lr=lr_obj, betas=(0.9, 0.999), eps=1e-8)
+        optimizers.append(obj_optimizer)
+        if scheduler == "cosine":
+            lr_schedulers.append(CosineAnnealingLR(obj_optimizer, T_max=num_iter, eta_min=eta_min))
+        if seidel_coeffs.requires_grad:
+            seidel_sgd = torch.optim.SGD([seidel_coeffs], lr=lr_seidel, momentum=0.0)
+            optimizers.append(seidel_sgd)
+            if scheduler == "cosine":
+                lr_schedulers.append(CosineAnnealingLR(seidel_sgd, T_max=num_iter, eta_min=eta_min))
 
     loss_history: list[float] = []
     ssim_history: list[float] = []
@@ -238,10 +253,12 @@ def train(
             + defocus_anchor_weight * loss_anchor
         )
 
-        optimizer.zero_grad()
+        for optimizer in optimizers:
+            optimizer.zero_grad()
         loss.backward()
-        optimizer.step()
-        if lr_scheduler is not None:
+        for optimizer in optimizers:
+            optimizer.step()
+        for lr_scheduler in lr_schedulers:
             lr_scheduler.step()
 
         loss_history.append(loss.item())

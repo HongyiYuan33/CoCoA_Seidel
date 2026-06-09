@@ -1,0 +1,70 @@
+{
+  "name": "Seidel4D-TunedAdam-256-v1",
+  "aliases": [
+    "S4D-TunedAdam256",
+    "capacity4d-baseline-adam",
+    "4d-consistent-adam-baseline",
+    "tunedprior-4d-adam-256"
+  ],
+  "purpose": "Reusable 4D-consistent Adam baseline for Seidel recovery.",
+  "canonical_run_root": "outputs/cocoa_like_2d_mechanism/capacity4d_dirrms_tunedprior_size256_four_images_20260607__baseline",
+  "seidel_convention": "classical4d",
+  "fixed_seidel_indices": [4, 5],
+  "fixed_coefficients": {
+    "W311": 0.0,
+    "Wd": 0.0
+  },
+  "ground_truth_generation": {
+    "candidate_mode": "direction",
+    "mask_fixed_indices_before_rms_scaling": true,
+    "rms_measure": "field_weighted_wavefront_rms",
+    "directions": ["cocoa_signed", "signed_balanced"],
+    "strengths": [0.06, 0.2, 0.4]
+  },
+  "images": [
+    "Test_figure_1",
+    "Iksung_beads",
+    "dendrites",
+    "dendrites_dense"
+  ],
+  "training": {
+    "stage": "stage1",
+    "modes": ["joint"],
+    "stage1_size": 256,
+    "stage1_pretrain_iter": 400,
+    "stage1_num_iter": 1000,
+    "pretrain_scalar": 5.0,
+    "lr_obj": 0.005,
+    "lr_seidel": 0.01,
+    "seidel_optimizer": "adam",
+    "object_optimizer": "adam",
+    "rsd_weight": 0.001,
+    "tv_weight": 0.0,
+    "defocus_anchor_weight": 1.0,
+    "scheduler": "cosine",
+    "eta_min_ratio": 0.04
+  },
+  "object_model": {
+    "nerf_depth": 6,
+    "nerf_width": 128,
+    "nerf_skips": [2, 4, 6],
+    "fourier_num_angles": 60,
+    "fourier_num_octaves": 7,
+    "output_mode": "softplus",
+    "nerf_beta": 5.0,
+    "max_val": 20.0
+  },
+  "evaluation": {
+    "operator_eval_dim": 256,
+    "theta_convention": "classical4d",
+    "dataset_twin_invariance_pass": true,
+    "primary_metric": "operator_error_calibrated",
+    "secondary_metrics": [
+      "aligned_wavefront_error_physical",
+      "aligned_coeff_relative_error_physical",
+      "ssim_recon_gain_vs_gt",
+      "nrmse_recon_gain_vs_gt"
+    ]
+  },
+  "reuse_warning": "Do not compare directly against older 4D runs unless they also use 4D-consistent GT generation and the same tuned object-prior hyperparameters."
+}

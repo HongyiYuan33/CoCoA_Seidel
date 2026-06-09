@@ -284,6 +284,7 @@ def run_args_for_case(
         pretrain_iter=pretrain_iter,
         lr_obj=sweep_args.lr_obj,
         lr_seidel=sweep_args.lr_seidel,
+        seidel_optimizer=sweep_args.seidel_optimizer,
         rsd_weight=sweep_args.rsd_weight,
         tv_weight=sweep_args.tv_weight,
         pretrain_scalar=sweep_args.pretrain_scalar,
@@ -1035,6 +1036,8 @@ def run_stage1_case_subprocess(
         str(args.lr_obj),
         "--lr-seidel",
         str(args.lr_seidel),
+        "--seidel-optimizer",
+        args.seidel_optimizer,
         "--rsd-weight",
         str(args.rsd_weight),
         "--tv-weight",
@@ -1243,6 +1246,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stage3-num-iter", type=int, default=STAGE3["num_iter"])
     parser.add_argument("--lr-obj", type=float, default=5e-3)
     parser.add_argument("--lr-seidel", type=float, default=1e-2)
+    parser.add_argument(
+        "--seidel-optimizer",
+        choices=["adam", "sgd"],
+        default="adam",
+        help="Optimizer for trainable Seidel coefficients. Object MLP always uses Adam.",
+    )
     parser.add_argument("--rsd-weight", type=float, default=5e-4)
     parser.add_argument("--tv-weight", type=float, default=0.0)
     parser.add_argument("--pretrain-scalar", type=float, default=5.0)

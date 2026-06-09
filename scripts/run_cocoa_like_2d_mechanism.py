@@ -584,6 +584,7 @@ def train_cocoa_like(
     num_iter: int,
     lr_obj: float,
     lr_seidel: float,
+    seidel_optimizer: str,
     rsd_weight: float,
     tv_weight: float,
     defocus_anchor_weight: float,
@@ -613,18 +614,31 @@ def train_cocoa_like(
         with torch.no_grad():
             seidel_coeffs[list(fixed)] = 0.0
 
-    param_groups: list[dict] = [{"params": net_obj.parameters(), "lr": lr_obj}]
-    if seidel_coeffs.requires_grad:
-        param_groups.append({"params": [seidel_coeffs], "lr": lr_seidel})
+    seidel_optimizer = str(seidel_optimizer).lower()
+    if seidel_optimizer not in {"adam", "sgd"}:
+        raise ValueError(f"Unsupported seidel_optimizer={seidel_optimizer!r}")
 
-    optimizer = torch.optim.Adam(param_groups, betas=(0.9, 0.999), eps=1e-8)
-    lr_scheduler = (
-        CosineAnnealingLR(
-            optimizer, T_max=num_iter, eta_min=lr_seidel * eta_min_ratio
-        )
-        if scheduler == "cosine"
-        else None
-    )
+    eta_min = lr_seidel * eta_min_ratio
+    optimizers: list[torch.optim.Optimizer] = []
+    lr_schedulers: list[CosineAnnealingLR] = []
+    if seidel_optimizer == "adam":
+        param_groups: list[dict] = [{"params": net_obj.parameters(), "lr": lr_obj}]
+        if seidel_coeffs.requires_grad:
+            param_groups.append({"params": [seidel_coeffs], "lr": lr_seidel})
+        optimizer = torch.optim.Adam(param_groups, betas=(0.9, 0.999), eps=1e-8)
+        optimizers.append(optimizer)
+        if scheduler == "cosine":
+            lr_schedulers.append(CosineAnnealingLR(optimizer, T_max=num_iter, eta_min=eta_min))
+    else:
+        obj_optimizer = torch.optim.Adam(net_obj.parameters(), lr=lr_obj, betas=(0.9, 0.999), eps=1e-8)
+        optimizers.append(obj_optimizer)
+        if scheduler == "cosine":
+            lr_schedulers.append(CosineAnnealingLR(obj_optimizer, T_max=num_iter, eta_min=eta_min))
+        if seidel_coeffs.requires_grad:
+            seidel_sgd = torch.optim.SGD([seidel_coeffs], lr=lr_seidel, momentum=0.0)
+            optimizers.append(seidel_sgd)
+            if scheduler == "cosine":
+                lr_schedulers.append(CosineAnnealingLR(seidel_sgd, T_max=num_iter, eta_min=eta_min))
 
     psfs_cached: torch.Tensor | None = None
     if not seidel_coeffs.requires_grad:
@@ -740,13 +754,15 @@ def train_cocoa_like(
             + seidel_rms_floor_weight * loss_rms_floor
         )
 
-        optimizer.zero_grad()
+        for optimizer in optimizers:
+            optimizer.zero_grad()
         loss.backward()
-        optimizer.step()
+        for optimizer in optimizers:
+            optimizer.step()
         if fixed and seidel_coeffs.requires_grad:
             with torch.no_grad():
                 seidel_coeffs[list(fixed)] = 0.0
-        if lr_scheduler is not None:
+        for lr_scheduler in lr_schedulers:
             lr_scheduler.step()
 
         loss_history.append(float(loss.item()))
@@ -1072,6 +1088,7 @@ def run_one_mode(
         f"device={device} pretrain={args.pretrain_iter} joint={args.num_iter} "
         f"mlp={args.nerf_depth}x{args.nerf_width} "
         f"skips={format_nerf_skips(args.nerf_skips)} "
+        f"seidel_optimizer={args.seidel_optimizer} "
         f"fourier={args.fourier_num_angles}x{args.fourier_num_octaves} "
         f"rms_floor_weight={args.seidel_rms_floor_weight:g} "
         f"rms_floor_alpha={args.seidel_rms_floor_alpha:g} "
@@ -1087,6 +1104,10 @@ def run_one_mode(
         measurement_scalar=args.pretrain_scalar,
         verbose=args.verbose,
     )
+    with torch.no_grad():
+        pretrain_render = net_obj.render(*meas_gt.shape).detach()
+        pretrain_target = (float(args.pretrain_scalar) * meas_gt.detach()).detach()
+        pretrain_abs_error = torch.abs(pretrain_render - pretrain_target).detach()
     result = train_cocoa_like(
         net_obj,
         seidel,
@@ -1096,6 +1117,7 @@ def run_one_mode(
         num_iter=args.num_iter,
         lr_obj=args.lr_obj,
         lr_seidel=args.lr_seidel,
+        seidel_optimizer=args.seidel_optimizer,
         rsd_weight=args.rsd_weight,
         tv_weight=args.tv_weight,
         defocus_anchor_weight=args.defocus_anchor_weight,
@@ -1114,12 +1136,32 @@ def run_one_mode(
     )
     result = result._replace(elapsed_s=time.time() - t0)
     metrics = compute_metrics(sharp_gt, meas_gt, result, gt_np, mode=mode, args=args)
+    pretrain_render_np = pretrain_render.detach().cpu().numpy()
+    pretrain_target_np = pretrain_target.detach().cpu().numpy()
+    metrics.update(
+        {
+            "pretrain_final_loss": (
+                float(pretrain_history[-1]) if pretrain_history else float("nan")
+            ),
+            "pretrain_render_ssim_vs_target": (
+                float(1.0 - pretrain_history[-1]) if pretrain_history else float("nan")
+            ),
+            "pretrain_render_nrmse_vs_target": compute_nrmse(
+                pretrain_target_np,
+                pretrain_render_np,
+            ),
+            "pretrain_render_hf_ratio": high_frequency_ratio(pretrain_render_np),
+        }
+    )
 
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     torch.save(
         {
             "sharp_gt": sharp_gt.detach().cpu(),
             "measurement_gt": meas_gt.detach().cpu(),
+            "pretrain_target": pretrain_target.detach().cpu(),
+            "pretrain_render": pretrain_render.detach().cpu(),
+            "pretrain_abs_error": pretrain_abs_error.detach().cpu(),
             "sharp_recon": result.sharp_final.detach().cpu(),
             "measurement_pred": result.measurement_pred.detach().cpu(),
             "seidel_final": result.seidel_final.detach().cpu(),
@@ -1159,6 +1201,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--pretrain-iter", type=int, default=400)
     ap.add_argument("--lr-obj", type=float, default=5e-3)
     ap.add_argument("--lr-seidel", type=float, default=1e-2)
+    ap.add_argument(
+        "--seidel-optimizer",
+        choices=["adam", "sgd"],
+        default="adam",
+        help="Optimizer for trainable Seidel coefficients. Object MLP always uses Adam.",
+    )
     ap.add_argument("--rsd-weight", type=float, default=5e-4)
     ap.add_argument("--tv-weight", type=float, default=0.0)
     ap.add_argument("--pretrain-scalar", type=float, default=5.0)
