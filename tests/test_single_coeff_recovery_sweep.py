@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import scripts.run_cocoa_like_2d_mechanism as cocoa
+import scripts.build_single_coeff_rcp_stats as single_coeff_rcp
 import scripts.run_cocoa_like_seidel_accuracy_sweep as sweep
 
 
@@ -70,6 +71,57 @@ def test_single_coeff_requires_classical6d():
                 "classical5d",
             ]
         )
+
+
+def test_single_coeff_positive_value_grid_includes_coef0p8():
+    args = sweep.parse_args(
+        [
+            "--stage",
+            "stage1",
+            "--candidate-mode",
+            "single_coeff",
+            "--seidel-convention",
+            "classical6d",
+            "--coefficients",
+            "W040",
+            "W131",
+            "W222",
+            "W220",
+            "W311",
+            "Wd",
+            "--coefficient-values",
+            "0.1",
+            "0.2",
+            "0.4",
+            "0.8",
+        ]
+    )
+    candidates = sweep.make_candidates(
+        args.directions,
+        args.strengths,
+        seidel_convention=args.seidel_convention,
+        candidate_mode=args.candidate_mode,
+        coefficients=args.coefficients,
+        coefficient_values=args.coefficient_values,
+    )
+
+    assert len(candidates) == 24
+    by_id = {candidate.candidate_id: candidate for candidate in candidates}
+    assert "Wd__coef0p8" in by_id
+    np.testing.assert_allclose(by_id["Wd__coef0p8"].seidel, [0.0, 0.0, 0.0, 0.0, 0.0, 0.8])
+    assert by_id["Wd__coef0p8"].fixed_seidel_indices == (0, 1, 2, 3, 4)
+
+
+def test_single_coeff_rcp_value_order_is_inferred_from_rows():
+    rows = [
+        {"active_seidel_value": "0.8"},
+        {"active_seidel_value": "-0.4"},
+        {"active_seidel_value": "0.1"},
+        {"active_seidel_value": "-0.1"},
+        {"active_seidel_value": "0.4"},
+    ]
+
+    assert single_coeff_rcp.infer_value_order(rows) == [0.1, 0.4, 0.8, -0.1, -0.4]
 
 
 def test_augment_metrics_records_active_error_and_leakage():
@@ -148,6 +200,7 @@ def test_run_one_mode_fixed_override_is_written_to_metrics(tmp_path, monkeypatch
         num_iter=1,
         lr_obj=1e-3,
         lr_seidel=1e-3,
+        seidel_optimizer="adam",
         pretrain_scalar=1.0,
         rsd_weight=0.0,
         tv_weight=0.0,

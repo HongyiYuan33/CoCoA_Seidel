@@ -446,12 +446,75 @@ class CocoaLikeResult(NamedTuple):
     elapsed_s: float
 
 
+class PretrainDetails(NamedTuple):
+    loss_history: list[float]
+    ssim_history: list[float]
+    rsd_history: list[float]
+    edge_history: list[float]
+    target: torch.Tensor
+
+
 def reciprocal_std_contrast_loss(img: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """CoCoA's reciprocal contrast prior: reciprocal(std / mean)."""
 
     mean = torch.mean(img).clamp_min(eps)
     contrast = torch.std(img) / mean
     return torch.reciprocal(contrast.clamp_min(eps))
+
+
+def pretrain_target_transform(
+    measurement_gt: torch.Tensor,
+    *,
+    measurement_scalar: float,
+    target_transform: str,
+    contrast_alpha: float,
+    percentile_lo: float,
+    percentile_hi: float,
+    gamma: float,
+) -> torch.Tensor:
+    """Build the object-pretrain target from the measurement."""
+
+    target = float(measurement_scalar) * measurement_gt.detach()
+    target_transform = str(target_transform or "none").lower()
+    if target_transform == "none":
+        return target
+    if target_transform == "linear_contrast":
+        mean = torch.mean(target)
+        return torch.clamp(mean + float(contrast_alpha) * (target - mean), min=0.0)
+    if target_transform == "percentile_gamma":
+        lo_q = max(0.0, min(1.0, float(percentile_lo) / 100.0))
+        hi_q = max(0.0, min(1.0, float(percentile_hi) / 100.0))
+        if hi_q <= lo_q:
+            raise ValueError(
+                f"pretrain_percentile_hi must exceed lo, got {percentile_lo}, {percentile_hi}"
+            )
+        flat = target.reshape(-1)
+        lo = torch.quantile(flat, lo_q)
+        hi = torch.quantile(flat, hi_q)
+        stretched = torch.clamp((target - lo) / (hi - lo).clamp_min(1e-8), 0.0, 1.0)
+        return torch.pow(stretched, float(gamma))
+    raise ValueError(f"Unknown pretrain target transform {target_transform!r}")
+
+
+def sobel_magnitude(img: torch.Tensor) -> torch.Tensor:
+    """Sobel gradient magnitude for a 2-D tensor."""
+
+    if img.ndim != 2:
+        raise ValueError(f"sobel_magnitude expects 2-D tensor, got {tuple(img.shape)}")
+    kernel_x = torch.tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+        device=img.device,
+        dtype=img.dtype,
+    ).view(1, 1, 3, 3)
+    kernel_y = torch.tensor(
+        [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+        device=img.device,
+        dtype=img.dtype,
+    ).view(1, 1, 3, 3)
+    padded = img.view(1, 1, *img.shape)
+    gx = F.conv2d(padded, kernel_x, padding=1)
+    gy = F.conv2d(padded, kernel_y, padding=1)
+    return torch.sqrt((gx.square() + gy.square()).clamp_min(1e-12)).view_as(img)
 
 
 def _coerce_backend6_torch(theta: torch.Tensor) -> torch.Tensor:
@@ -552,25 +615,76 @@ def pretrain_cocoa_like(
     num_iter: int,
     lr: float,
     measurement_scalar: float,
-    verbose: bool,
-) -> list[float]:
+    target_transform: str = "none",
+    contrast_alpha: float = 1.0,
+    percentile_lo: float = 1.0,
+    percentile_hi: float = 99.0,
+    gamma: float = 1.0,
+    pretrain_rsd_weight: float = 0.0,
+    pretrain_edge_weight: float = 0.0,
+    pretrain_edge_mode: str = "sobel",
+    return_details: bool = False,
+    verbose: bool = False,
+) -> list[float] | PretrainDetails:
     H, W = measurement_gt.shape
-    target = measurement_scalar * measurement_gt.detach()
+    target = pretrain_target_transform(
+        measurement_gt,
+        measurement_scalar=measurement_scalar,
+        target_transform=target_transform,
+        contrast_alpha=contrast_alpha,
+        percentile_lo=percentile_lo,
+        percentile_hi=percentile_hi,
+        gamma=gamma,
+    )
+    target_edge: torch.Tensor | None = None
+    if float(pretrain_edge_weight) > 0.0:
+        if str(pretrain_edge_mode).lower() != "sobel":
+            raise ValueError(f"Unsupported pretrain_edge_mode={pretrain_edge_mode!r}")
+        target_edge = sobel_magnitude(target)
     optimizer = torch.optim.Adam(net_obj.parameters(), lr=lr)
     history: list[float] = []
+    ssim_history: list[float] = []
+    rsd_history: list[float] = []
+    edge_history: list[float] = []
     log_every = max(1, num_iter // 10)
 
     for step in range(num_iter):
         sharp = net_obj.render(H, W)
-        loss = ssim_loss(sharp, target)
+        loss_ssim = ssim_loss(sharp, target)
+        loss_rsd = reciprocal_std_contrast_loss(sharp)
+        if target_edge is not None:
+            loss_edge = F.l1_loss(sobel_magnitude(sharp), target_edge)
+        else:
+            loss_edge = torch.zeros((), device=sharp.device, dtype=sharp.dtype)
+        loss = (
+            loss_ssim
+            + float(pretrain_rsd_weight) * loss_rsd
+            + float(pretrain_edge_weight) * loss_edge
+        )
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         history.append(float(loss.item()))
+        ssim_history.append(float(loss_ssim.item()))
+        rsd_history.append(float(loss_rsd.item()))
+        edge_history.append(float(loss_edge.item()))
 
         if verbose and (step % log_every == 0 or step == num_iter - 1):
-            print(f"[pretrain {step:04d}] ssim={loss.item():.6f}", flush=True)
+            print(
+                f"[pretrain {step:04d}] loss={loss.item():.6f} "
+                f"ssim={loss_ssim.item():.6f} rsd={loss_rsd.item():.6f} "
+                f"edge={loss_edge.item():.6f}",
+                flush=True,
+            )
 
+    if return_details:
+        return PretrainDetails(
+            loss_history=history,
+            ssim_history=ssim_history,
+            rsd_history=rsd_history,
+            edge_history=edge_history,
+            target=target.detach(),
+        )
     return history
 
 
@@ -1096,17 +1210,36 @@ def run_one_mode(
         flush=True,
     )
     t0 = time.time()
-    pretrain_history = pretrain_cocoa_like(
+    pretrain_target_transform = getattr(args, "pretrain_target_transform", "none")
+    pretrain_contrast_alpha = getattr(args, "pretrain_contrast_alpha", 1.0)
+    pretrain_percentile_lo = getattr(args, "pretrain_percentile_lo", 1.0)
+    pretrain_percentile_hi = getattr(args, "pretrain_percentile_hi", 99.0)
+    pretrain_gamma = getattr(args, "pretrain_gamma", 1.0)
+    pretrain_rsd_weight = getattr(args, "pretrain_rsd_weight", 0.0)
+    pretrain_edge_weight = getattr(args, "pretrain_edge_weight", 0.0)
+    pretrain_edge_mode = getattr(args, "pretrain_edge_mode", "sobel")
+    pretrain_details = pretrain_cocoa_like(
         net_obj,
         meas_gt,
         num_iter=args.pretrain_iter,
         lr=args.lr_obj,
         measurement_scalar=args.pretrain_scalar,
+        target_transform=pretrain_target_transform,
+        contrast_alpha=pretrain_contrast_alpha,
+        percentile_lo=pretrain_percentile_lo,
+        percentile_hi=pretrain_percentile_hi,
+        gamma=pretrain_gamma,
+        pretrain_rsd_weight=pretrain_rsd_weight,
+        pretrain_edge_weight=pretrain_edge_weight,
+        pretrain_edge_mode=pretrain_edge_mode,
+        return_details=True,
         verbose=args.verbose,
     )
+    assert isinstance(pretrain_details, PretrainDetails)
+    pretrain_history = pretrain_details.loss_history
     with torch.no_grad():
         pretrain_render = net_obj.render(*meas_gt.shape).detach()
-        pretrain_target = (float(args.pretrain_scalar) * meas_gt.detach()).detach()
+        pretrain_target = pretrain_details.target.detach()
         pretrain_abs_error = torch.abs(pretrain_render - pretrain_target).detach()
     result = train_cocoa_like(
         net_obj,
@@ -1143,14 +1276,49 @@ def run_one_mode(
             "pretrain_final_loss": (
                 float(pretrain_history[-1]) if pretrain_history else float("nan")
             ),
+            "pretrain_final_ssim_loss": (
+                float(pretrain_details.ssim_history[-1])
+                if pretrain_details.ssim_history
+                else float("nan")
+            ),
+            "pretrain_final_rsd_loss": (
+                float(pretrain_details.rsd_history[-1])
+                if pretrain_details.rsd_history
+                else float("nan")
+            ),
+            "pretrain_final_edge_loss": (
+                float(pretrain_details.edge_history[-1])
+                if pretrain_details.edge_history
+                else float("nan")
+            ),
+            "pretrain_final_weighted_rsd_loss": (
+                float(pretrain_rsd_weight) * float(pretrain_details.rsd_history[-1])
+                if pretrain_details.rsd_history
+                else float("nan")
+            ),
+            "pretrain_final_weighted_edge_loss": (
+                float(pretrain_edge_weight) * float(pretrain_details.edge_history[-1])
+                if pretrain_details.edge_history
+                else float("nan")
+            ),
             "pretrain_render_ssim_vs_target": (
-                float(1.0 - pretrain_history[-1]) if pretrain_history else float("nan")
+                float(1.0 - pretrain_details.ssim_history[-1])
+                if pretrain_details.ssim_history
+                else float("nan")
             ),
             "pretrain_render_nrmse_vs_target": compute_nrmse(
                 pretrain_target_np,
                 pretrain_render_np,
             ),
             "pretrain_render_hf_ratio": high_frequency_ratio(pretrain_render_np),
+            "pretrain_target_transform": pretrain_target_transform,
+            "pretrain_contrast_alpha": float(pretrain_contrast_alpha),
+            "pretrain_percentile_lo": float(pretrain_percentile_lo),
+            "pretrain_percentile_hi": float(pretrain_percentile_hi),
+            "pretrain_gamma": float(pretrain_gamma),
+            "pretrain_rsd_weight": float(pretrain_rsd_weight),
+            "pretrain_edge_weight": float(pretrain_edge_weight),
+            "pretrain_edge_mode": pretrain_edge_mode,
         }
     )
 
@@ -1173,6 +1341,9 @@ def run_one_mode(
             "seidel_rms_floor_history": result.seidel_rms_floor_history,
             "seidel_wavefront_rms_history": result.seidel_wavefront_rms_history,
             "pretrain_history": result.pretrain_history,
+            "pretrain_ssim_history": pretrain_details.ssim_history,
+            "pretrain_rsd_history": pretrain_details.rsd_history,
+            "pretrain_edge_history": pretrain_details.edge_history,
         },
         out_dir / "tensors.pt",
     )
@@ -1210,6 +1381,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--rsd-weight", type=float, default=5e-4)
     ap.add_argument("--tv-weight", type=float, default=0.0)
     ap.add_argument("--pretrain-scalar", type=float, default=5.0)
+    ap.add_argument(
+        "--pretrain-target-transform",
+        choices=["none", "linear_contrast", "percentile_gamma"],
+        default="none",
+    )
+    ap.add_argument("--pretrain-contrast-alpha", type=float, default=1.0)
+    ap.add_argument("--pretrain-percentile-lo", type=float, default=1.0)
+    ap.add_argument("--pretrain-percentile-hi", type=float, default=99.0)
+    ap.add_argument("--pretrain-gamma", type=float, default=1.0)
+    ap.add_argument("--pretrain-rsd-weight", type=float, default=0.0)
+    ap.add_argument("--pretrain-edge-weight", type=float, default=0.0)
+    ap.add_argument("--pretrain-edge-mode", choices=["sobel"], default="sobel")
     ap.add_argument("--defocus-anchor-weight", type=float, default=1.0)
     ap.add_argument("--defocus-index", type=int, default=5)
     ap.add_argument(

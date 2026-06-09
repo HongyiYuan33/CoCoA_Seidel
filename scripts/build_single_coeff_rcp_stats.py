@@ -33,7 +33,7 @@ from hybrid_ring_cocoa.evaluation.seidel_operator_evaluator import (  # noqa: E4
 
 RUN_NAME = "single_coeff_recovery_6d_size256_four_images_pre400_joint1000_20260607"
 COEFF_LABELS = ["W040", "W131", "W222", "W220", "W311", "Wd"]
-VALUE_ORDER = [0.1, 0.2, 0.4, -0.1, -0.2, -0.4]
+DEFAULT_VALUE_ORDER = [0.1, 0.2, 0.4, -0.1, -0.2, -0.4]
 IMAGE_ORDER = ["Test_figure_1", "Iksung_beads", "dendrites", "dendrites_dense"]
 
 
@@ -140,6 +140,28 @@ def display_path(path: Path) -> str:
         return str(path)
 
 
+def value_sort_key(value: float) -> tuple[int, float]:
+    value = float(value)
+    if value > 0:
+        return (0, abs(value))
+    if value == 0:
+        return (1, 0.0)
+    return (2, abs(value))
+
+
+def infer_value_order(rows: list[dict[str, Any]]) -> list[float]:
+    values: dict[float, float] = {}
+    for row in rows:
+        raw = row.get("active_seidel_value")
+        if raw in (None, ""):
+            continue
+        value = float(raw)
+        values.setdefault(round(value, 4), value)
+    if not values:
+        return list(DEFAULT_VALUE_ORDER)
+    return sorted(values.values(), key=value_sort_key)
+
+
 def load_operator_rows(run_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for coeff in COEFF_LABELS:
@@ -148,11 +170,12 @@ def load_operator_rows(run_dir: Path) -> list[dict[str, Any]]:
         for row in coeff_rows:
             row["_operator_eval_coeff"] = coeff
         rows.extend(coeff_rows)
+    value_rank = {round(value, 4): idx for idx, value in enumerate(infer_value_order(rows))}
     rows.sort(
         key=lambda row: (
             IMAGE_ORDER.index(row["image"]) if row["image"] in IMAGE_ORDER else 999,
             COEFF_LABELS.index(row["active_seidel_name"]),
-            VALUE_ORDER.index(round(float(row["active_seidel_value"]), 4)),
+            value_rank.get(round(float(row["active_seidel_value"]), 4), 999),
         )
     )
     return rows
@@ -266,7 +289,8 @@ def save_heatmap(
 def make_stat_plots(rows: list[dict[str, Any]], out_dir: Path) -> None:
     stats_dir = out_dir / "stats"
     stats_dir.mkdir(parents=True, exist_ok=True)
-    value_labels = [f"{v:g}" for v in VALUE_ORDER]
+    value_order = infer_value_order(rows)
+    value_labels = [f"{v:g}" for v in value_order]
     metrics = [
         ("operator_error_calibrated_f", "mean operator_error_calibrated", "operator_error_heatmap_by_coeff_value.png", "viridis_r"),
         ("active_aligned_abs_error", "mean active aligned abs error", "active_coeff_abs_error_heatmap.png", "magma_r"),
@@ -280,7 +304,7 @@ def make_stat_plots(rows: list[dict[str, Any]], out_dir: Path) -> None:
             col_key="active_seidel_value",
             value_key=value_key,
             row_order=COEFF_LABELS,
-            col_order=VALUE_ORDER,
+            col_order=value_order,
         )
         save_heatmap(
             matrix,

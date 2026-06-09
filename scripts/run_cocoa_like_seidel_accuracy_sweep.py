@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import datetime as dt
 import json
@@ -49,6 +50,13 @@ STAGE3 = {"size": 256, "pretrain_iter": 400, "num_iter": 1000}
 COEFF_NAMES = ["W040", "W131", "W222", "W220", "W311", "Wd"]
 COEFF_INDEX = {name: idx for idx, name in enumerate(COEFF_NAMES)}
 DEFAULT_SINGLE_COEFF_VALUES = [0.1, 0.2, 0.4, -0.1, -0.2, -0.4]
+DEFAULT_GT_LOCKED_SOURCE_CSV = (
+    PROJECT_ROOT
+    / "outputs"
+    / "cocoa_like_2d_mechanism"
+    / "capacity4d_dirrms_tunedprior_size256_four_images_20260607__baseline"
+    / "stage1_metrics.csv"
+)
 
 
 @dataclass(frozen=True)
@@ -95,6 +103,20 @@ def parse_coefficient_names(values: Iterable[str] | None) -> list[str]:
         if name not in names:
             names.append(name)
     return names
+
+
+def parse_vector_jsonish(value: str) -> np.ndarray:
+    text = str(value).strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = ast.literal_eval(text)
+    arr = np.asarray(parsed, dtype=np.float64).reshape(-1)
+    if arr.shape != (6,):
+        raise ValueError(f"Expected a backend-6D Seidel vector, got shape {arr.shape}")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("Seidel vector contains non-finite values")
+    return arr
 
 
 def get_pupil_grid(n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -147,12 +169,26 @@ def make_candidates(
     candidate_mode: str = "direction",
     coefficients: list[str] | None = None,
     coefficient_values: list[float] | None = None,
+    gt_locked_source_csv: Path | None = None,
+    gt_locked_w311_scale: float = -0.5,
+    gt_locked_wd_scale: float = 0.5,
+    gt_locked_atol: float = 1e-7,
 ) -> list[Candidate]:
     if candidate_mode == "single_coeff":
         return make_single_coeff_candidates(
             coefficients=coefficients,
             coefficient_values=coefficient_values,
             seidel_convention=seidel_convention,
+        )
+    if candidate_mode == "gt_locked_front4":
+        return make_gt_locked_front4_candidates(
+            directions=directions,
+            strengths=strengths,
+            seidel_convention=seidel_convention,
+            source_csv=gt_locked_source_csv,
+            w311_scale=gt_locked_w311_scale,
+            wd_scale=gt_locked_wd_scale,
+            atol=gt_locked_atol,
         )
     if candidate_mode != "direction":
         raise ValueError(f"Unknown candidate_mode={candidate_mode!r}")
@@ -178,6 +214,74 @@ def make_candidates(
                     target_rms=float(target),
                     seidel=seidel.astype(np.float32),
                     actual_rms=actual,
+                )
+            )
+    return candidates
+
+
+def make_gt_locked_front4_candidates(
+    *,
+    directions: list[str],
+    strengths: list[float],
+    seidel_convention: str,
+    source_csv: Path | None,
+    w311_scale: float,
+    wd_scale: float,
+    atol: float,
+) -> list[Candidate]:
+    if seidel_convention not in {"classical5d", "classical6d"}:
+        raise ValueError("--candidate-mode gt_locked_front4 requires classical5d or classical6d")
+    source_path = Path(source_csv or DEFAULT_GT_LOCKED_SOURCE_CSV)
+    if not source_path.is_file():
+        raise FileNotFoundError(f"GT-locked source CSV not found: {source_path}")
+
+    wanted = {(direction, round(float(strength), 8)) for direction in directions for strength in strengths}
+    by_key: dict[tuple[str, float], np.ndarray] = {}
+    with source_path.open(newline="") as f:
+        for row in csv.DictReader(f):
+            if str(row.get("sweep_case_complete", "")).lower() not in {"true", "1", "yes"}:
+                continue
+            direction = str(row.get("direction", ""))
+            if direction not in directions:
+                continue
+            try:
+                target = round(float(row.get("target_wavefront_rms", "")), 8)
+            except ValueError:
+                continue
+            key = (direction, target)
+            if key not in wanted:
+                continue
+            if str(row.get("seidel_convention", "classical4d")) != "classical4d":
+                raise ValueError(f"GT-locked source row is not classical4d for {key}: {source_path}")
+            vec = parse_vector_jsonish(row["seidel_gt"])
+            if np.max(np.abs(vec[4:])) > atol:
+                raise ValueError(f"GT-locked source row has nonzero W311/Wd for {key}: {vec.tolist()}")
+            prior = by_key.get(key)
+            if prior is None:
+                by_key[key] = vec
+            elif np.max(np.abs(prior[:4] - vec[:4])) > atol:
+                raise ValueError(f"GT-locked source has inconsistent front-four coefficients for {key}")
+
+    candidates: list[Candidate] = []
+    for direction in directions:
+        for target in strengths:
+            target_f = float(target)
+            key = (direction, round(target_f, 8))
+            if key not in by_key:
+                raise ValueError(f"Missing GT-locked source candidate for direction={direction} RMS={target_f:g}")
+            seidel = by_key[key].copy()
+            seidel[4] = float(w311_scale) * target_f
+            seidel[5] = 0.0 if seidel_convention == "classical5d" else float(wd_scale) * target_f
+            actual = field_weighted_wavefront_rms(seidel)
+            candidate_id = f"{direction}__rms{tag_float(target_f)}"
+            candidates.append(
+                Candidate(
+                    candidate_id=candidate_id,
+                    direction=direction,
+                    target_rms=target_f,
+                    seidel=seidel.astype(np.float32),
+                    actual_rms=actual,
+                    candidate_mode="gt_locked_front4",
                 )
             )
     return candidates
@@ -288,6 +392,14 @@ def run_args_for_case(
         rsd_weight=sweep_args.rsd_weight,
         tv_weight=sweep_args.tv_weight,
         pretrain_scalar=sweep_args.pretrain_scalar,
+        pretrain_target_transform=sweep_args.pretrain_target_transform,
+        pretrain_contrast_alpha=sweep_args.pretrain_contrast_alpha,
+        pretrain_percentile_lo=sweep_args.pretrain_percentile_lo,
+        pretrain_percentile_hi=sweep_args.pretrain_percentile_hi,
+        pretrain_gamma=sweep_args.pretrain_gamma,
+        pretrain_rsd_weight=sweep_args.pretrain_rsd_weight,
+        pretrain_edge_weight=sweep_args.pretrain_edge_weight,
+        pretrain_edge_mode=sweep_args.pretrain_edge_mode,
         defocus_anchor_weight=defocus_anchor_weight,
         defocus_index=sweep_args.defocus_index,
         seidel_rms_floor_weight=sweep_args.seidel_rms_floor_weight,
@@ -1044,6 +1156,22 @@ def run_stage1_case_subprocess(
         str(args.tv_weight),
         "--pretrain-scalar",
         str(args.pretrain_scalar),
+        "--pretrain-target-transform",
+        args.pretrain_target_transform,
+        "--pretrain-contrast-alpha",
+        str(args.pretrain_contrast_alpha),
+        "--pretrain-percentile-lo",
+        str(args.pretrain_percentile_lo),
+        "--pretrain-percentile-hi",
+        str(args.pretrain_percentile_hi),
+        "--pretrain-gamma",
+        str(args.pretrain_gamma),
+        "--pretrain-rsd-weight",
+        str(args.pretrain_rsd_weight),
+        "--pretrain-edge-weight",
+        str(args.pretrain_edge_weight),
+        "--pretrain-edge-mode",
+        args.pretrain_edge_mode,
         "--defocus-anchor-weight",
         str(args.defocus_anchor_weight),
         "--defocus-index",
@@ -1079,6 +1207,19 @@ def run_stage1_case_subprocess(
         "--skip-report",
         "--skip-config-write",
     ]
+    if args.candidate_mode == "gt_locked_front4":
+        cmd.extend(
+            [
+                "--gt-locked-source-csv",
+                str(args.gt_locked_source_csv),
+                "--gt-locked-w311-scale",
+                str(args.gt_locked_w311_scale),
+                "--gt-locked-wd-scale",
+                str(args.gt_locked_wd_scale),
+                "--gt-locked-atol",
+                str(args.gt_locked_atol),
+            ]
+        )
     if candidate.candidate_mode == "single_coeff":
         assert candidate.active_seidel_name is not None
         assert candidate.active_seidel_value is not None
@@ -1189,7 +1330,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--stage", choices=["all", "stage1", "stage2", "stage3", "report"], default="all")
     parser.add_argument("--images", nargs="+", choices=sorted(cocoa.IMAGE_PATHS), default=IMAGES)
-    parser.add_argument("--candidate-mode", choices=["direction", "single_coeff"], default="direction")
+    parser.add_argument(
+        "--candidate-mode",
+        choices=["direction", "single_coeff", "gt_locked_front4"],
+        default="direction",
+    )
     parser.add_argument("--directions", nargs="+", choices=sorted(DIRECTIONS), default=list(DIRECTIONS))
     parser.add_argument("--strengths", nargs="+", default=[str(v) for v in STRENGTHS])
     parser.add_argument(
@@ -1203,6 +1348,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs="+",
         default=None,
         help="Direct coefficient values for --candidate-mode single_coeff.",
+    )
+    parser.add_argument(
+        "--gt-locked-source-csv",
+        type=Path,
+        default=DEFAULT_GT_LOCKED_SOURCE_CSV,
+        help=(
+            "Stage1 metrics CSV whose classical4d seidel_gt front-four coefficients "
+            "are used by --candidate-mode gt_locked_front4."
+        ),
+    )
+    parser.add_argument(
+        "--gt-locked-w311-scale",
+        type=float,
+        default=-0.5,
+        help="Set W311 to this scale times target RMS in gt_locked_front4 mode.",
+    )
+    parser.add_argument(
+        "--gt-locked-wd-scale",
+        type=float,
+        default=0.5,
+        help="Set Wd to this scale times target RMS for classical6d in gt_locked_front4 mode.",
+    )
+    parser.add_argument(
+        "--gt-locked-atol",
+        type=float,
+        default=1e-7,
+        help="Absolute tolerance for validating source front-four consistency.",
     )
     parser.add_argument(
         "--seidel-convention",
@@ -1255,6 +1427,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rsd-weight", type=float, default=5e-4)
     parser.add_argument("--tv-weight", type=float, default=0.0)
     parser.add_argument("--pretrain-scalar", type=float, default=5.0)
+    parser.add_argument(
+        "--pretrain-target-transform",
+        choices=["none", "linear_contrast", "percentile_gamma"],
+        default="none",
+    )
+    parser.add_argument("--pretrain-contrast-alpha", type=float, default=1.0)
+    parser.add_argument("--pretrain-percentile-lo", type=float, default=1.0)
+    parser.add_argument("--pretrain-percentile-hi", type=float, default=99.0)
+    parser.add_argument("--pretrain-gamma", type=float, default=1.0)
+    parser.add_argument("--pretrain-rsd-weight", type=float, default=0.0)
+    parser.add_argument("--pretrain-edge-weight", type=float, default=0.0)
+    parser.add_argument("--pretrain-edge-mode", choices=["sobel"], default="sobel")
     parser.add_argument("--defocus-anchor-weight", type=float, default=1.0)
     parser.add_argument("--defocus-index", type=int, default=5)
     parser.add_argument("--scheduler", choices=["cosine", "none"], default="cosine")
@@ -1299,6 +1483,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(str(exc))
     if args.candidate_mode == "single_coeff" and args.seidel_convention != "classical6d":
         parser.error("--candidate-mode single_coeff requires --seidel-convention classical6d")
+    if args.candidate_mode == "gt_locked_front4" and args.seidel_convention not in {"classical5d", "classical6d"}:
+        parser.error("--candidate-mode gt_locked_front4 requires --seidel-convention classical5d or classical6d")
+    if args.gt_locked_atol < 0.0:
+        raise ValueError("--gt-locked-atol must be non-negative")
     if args.seidel_rms_floor_weight < 0.0:
         raise ValueError("--seidel-rms-floor-weight must be non-negative")
     if args.seidel_rms_floor_alpha < 0.0:
@@ -1318,10 +1506,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def write_sweep_config(output_root: Path, args: argparse.Namespace, candidates: list[Candidate]) -> None:
+    args_payload = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
     write_json_atomic(
         output_root / "sweep_config.json",
         {
-            "args": vars(args),
+            "args": args_payload,
             **cocoa.convention_metadata(args.seidel_convention),
             "directions": DIRECTIONS,
             "coefficient_names": COEFF_NAMES,
@@ -1353,6 +1545,10 @@ def main() -> None:
         candidate_mode=args.candidate_mode,
         coefficients=args.coefficients,
         coefficient_values=args.coefficient_values,
+        gt_locked_source_csv=args.gt_locked_source_csv,
+        gt_locked_w311_scale=args.gt_locked_w311_scale,
+        gt_locked_wd_scale=args.gt_locked_wd_scale,
+        gt_locked_atol=args.gt_locked_atol,
     )
     output_root = cocoa.PROJECT_ROOT / "outputs" / "cocoa_like_2d_mechanism" / args.run_name
     output_root.mkdir(parents=True, exist_ok=True)
