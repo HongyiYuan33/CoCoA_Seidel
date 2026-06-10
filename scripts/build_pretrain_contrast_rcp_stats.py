@@ -362,6 +362,10 @@ def enrich_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         row["nrmse_f"] = parse_float(row, "nrmse_recon_gain_vs_gt")
         row["relative_wavefront_error_f"] = parse_float(row, "relative_wavefront_error")
         row["aligned_wavefront_error_physical_f"] = parse_float(row, "aligned_wavefront_error_physical")
+        row["aligned_coeff_absolute_error_physical_f"] = parse_float(
+            row,
+            "aligned_coeff_absolute_error_physical",
+        )
         row["aligned_coeff_relative_error_physical_f"] = parse_float(
             row,
             "aligned_coeff_relative_error_physical",
@@ -396,6 +400,7 @@ def grouped_summary(rows: list[dict[str, Any]], keys: list[str]) -> list[dict[st
         for metric in [
             "operator_error_calibrated_f",
             "aligned_wavefront_error_physical_f",
+            "aligned_coeff_absolute_error_physical_f",
             "aligned_coeff_relative_error_physical_f",
             "ssim_f",
             "nrmse_f",
@@ -450,6 +455,7 @@ def comparison_by_case(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "ssim": row["ssim_f"],
             "nrmse": row["nrmse_f"],
             "aligned_wavefront_error_physical": row["aligned_wavefront_error_physical_f"],
+            "aligned_coeff_absolute_error_physical": row["aligned_coeff_absolute_error_physical_f"],
             "aligned_coeff_relative_error_physical": row["aligned_coeff_relative_error_physical_f"],
             "pretrain_final_loss": row["pretrain_final_loss_f"],
             "pretrain_render_nrmse_vs_target": row["pretrain_render_nrmse_vs_target_f"],
@@ -474,15 +480,22 @@ def write_best_and_winner_stats(rows: list[dict[str, Any]], stats_dir: Path) -> 
     best_op = best_rows_by_metric(rows, "operator_error_calibrated_f", higher=False)
     best_ssim = best_rows_by_metric(rows, "ssim_f", higher=True)
     best_nrmse = best_rows_by_metric(rows, "nrmse_f", higher=False)
+    best_coeff_abs = best_rows_by_metric(
+        rows,
+        "aligned_coeff_absolute_error_physical_f",
+        higher=False,
+    )
     write_csv(best_op, stats_dir / "best_by_operator_error_calibrated.csv")
     write_csv(best_ssim, stats_dir / "best_by_ssim.csv")
     write_csv(best_nrmse, stats_dir / "best_by_nrmse.csv")
+    write_csv(best_coeff_abs, stats_dir / "best_by_aligned_coeff_absolute_error_physical.csv")
 
     winner_rows = []
     for metric_name, winners in [
         ("operator_error_calibrated", best_op),
         ("ssim", best_ssim),
         ("nrmse", best_nrmse),
+        ("aligned_coeff_absolute_error_physical", best_coeff_abs),
     ]:
         counter = Counter(str(row["pretrain_method"]) for row in winners)
         for method, count in sorted(counter.items(), key=lambda item: METHOD_ORDER.index(item[0])):
@@ -501,6 +514,7 @@ def write_best_and_winner_stats(rows: list[dict[str, Any]], stats_dir: Path) -> 
         ("operator_error_calibrated", best_op),
         ("ssim", best_ssim),
         ("nrmse", best_nrmse),
+        ("aligned_coeff_absolute_error_physical", best_coeff_abs),
     ]:
         counter = Counter(str(row.get("family", "unspecified")) for row in winners)
         for family, count in sorted(counter.items()):
@@ -517,6 +531,7 @@ def write_best_and_winner_stats(rows: list[dict[str, Any]], stats_dir: Path) -> 
         "operator_error_calibrated": best_op,
         "ssim": best_ssim,
         "nrmse": best_nrmse,
+        "aligned_coeff_absolute_error_physical": best_coeff_abs,
     }
 
 
@@ -828,6 +843,7 @@ def make_rcp(row: dict[str, Any], *, output_root: Path, prefix: str, out_dir: Pa
         ),
         (
             f"aligned_WFrel={short_float(row['aligned_wavefront_error_physical_f'])} | "
+            f"coeff_abs={short_float(row['aligned_coeff_absolute_error_physical_f'])} | "
             f"coeff_rel={short_float(row['aligned_coeff_relative_error_physical_f'])} | "
             f"best_phys={row.get('best_physical_transform', '?')}"
         ),
@@ -887,6 +903,8 @@ def make_rcp(row: dict[str, Any], *, output_root: Path, prefix: str, out_dir: Pa
         "operator_error_phys_equiv": row["operator_error_phys_equiv_f"],
         "ssim": row["ssim_f"],
         "nrmse": row["nrmse_f"],
+        "aligned_coeff_absolute_error_physical": row["aligned_coeff_absolute_error_physical_f"],
+        "aligned_coeff_relative_error_physical": row["aligned_coeff_relative_error_physical_f"],
         "pretrain_final_loss": row["pretrain_final_loss_f"],
         "pretrain_render_nrmse_vs_target": row["pretrain_render_nrmse_vs_target_f"],
         "gt_rms": row["gt_rms"],
@@ -978,6 +996,10 @@ def write_summary(out_dir: Path, rows: list[dict[str, Any]]) -> None:
     best_op = min(summary_rows, key=lambda row: float(row["operator_error_calibrated_f_mean"]))
     best_ssim = max(summary_rows, key=lambda row: float(row["ssim_f_mean"]))
     best_nrmse = min(summary_rows, key=lambda row: float(row["nrmse_f_mean"]))
+    best_coeff_abs = min(
+        summary_rows,
+        key=lambda row: float(row["aligned_coeff_absolute_error_physical_f_mean"]),
+    )
     comp_rows = comparison_by_case(rows)
     improved = [
         row
@@ -985,6 +1007,9 @@ def write_summary(out_dir: Path, rows: list[dict[str, Any]]) -> None:
         if row["pretrain_method"] != "baseline_scalar1"
         and math.isfinite(parse_float(row, "delta_operator_error_calibrated"))
         and parse_float(row, "delta_operator_error_calibrated") < 0
+    ]
+    baseline_rows = [
+        row for row in comp_rows if row["pretrain_method"] == "baseline_scalar1"
     ]
     lines = [
         "# Object-Pretrain Contrast Initialization Mini-Experiment",
@@ -998,18 +1023,29 @@ def write_summary(out_dir: Path, rows: list[dict[str, Any]]) -> None:
         ),
         f"- SSIM: {best_ssim['pretrain_method']} (mean={short_float(best_ssim['ssim_f_mean'])})",
         f"- NRMSE: {best_nrmse['pretrain_method']} (mean={short_float(best_nrmse['nrmse_f_mean'])})",
-        "",
         (
-            "Cases with lower operator error than baseline_scalar1: "
-            f"{len(improved)} / {max(0, len(comp_rows) - 3)} non-baseline comparisons"
+            f"- Aligned coeff abs error: {best_coeff_abs['pretrain_method']} "
+            f"(mean={short_float(best_coeff_abs['aligned_coeff_absolute_error_physical_f_mean'])})"
         ),
         "",
-        "Method means:",
     ]
+    if baseline_rows:
+        lines.extend(
+            [
+                (
+                    "Cases with lower operator error than baseline_scalar1: "
+                    f"{len(improved)} / {max(0, len(comp_rows) - len(baseline_rows))} "
+                    "non-baseline comparisons"
+                ),
+                "",
+            ]
+        )
+    lines.append("Method means:")
     for row in summary_rows:
         lines.append(
             "- "
             f"{row['pretrain_method']}: op={short_float(row['operator_error_calibrated_f_mean'])}, "
+            f"coeff_abs={short_float(row['aligned_coeff_absolute_error_physical_f_mean'])}, "
             f"SSIM={short_float(row['ssim_f_mean'])}, "
             f"NRMSE={short_float(row['nrmse_f_mean'])}, "
             f"pre_NRMSE={short_float(row['pretrain_render_nrmse_vs_target_f_mean'])}"
@@ -1021,9 +1057,11 @@ def write_summary(out_dir: Path, rows: list[dict[str, Any]]) -> None:
             "- `manifest.csv`: all RCP panels",
             "- `settings_manifest.csv`: setting definitions used for this run",
             "- `RCP_best_operator_overview.png`: best operator-error panel per image",
+            "- `RCP_best_aligned_coeff_abs_overview.png`: best aligned coefficient absolute-error panel per image",
             "- `stats/comparison_by_case.csv`: method results and deltas vs baseline",
             "- `stats/summary_by_setting.csv`: aggregate table by setting",
             "- `stats/summary_by_family.csv`: aggregate table by method family",
+            "- `stats/best_by_aligned_coeff_absolute_error_physical.csv`: best rows by aligned coefficient absolute error",
             "- `stats/method_metric_means.png`: compact metric bars",
             "- `stats/*heatmap*_operator_error.png`: coarse combination trends",
             "- `stats/fixed_scale_pretrain_panels/*.png`: fixed-scale target/render/error comparison",
@@ -1090,6 +1128,20 @@ def main(argv: list[str] | None = None) -> int:
             overview.append(manifest_by_identity[key])
     overview.sort(key=lambda row: IMAGE_ORDER.index(row["image"]) if row["image"] in IMAGE_ORDER else 999)
     make_overview(overview, out_dir / "RCP_best_operator_overview.png")
+    coeff_abs_overview = []
+    for row in best["aligned_coeff_absolute_error_physical"]:
+        key = (
+            row["image"],
+            row["direction"],
+            row["candidate_id"],
+            row["pretrain_method"],
+        )
+        if key in manifest_by_identity:
+            coeff_abs_overview.append(manifest_by_identity[key])
+    coeff_abs_overview.sort(
+        key=lambda row: IMAGE_ORDER.index(row["image"]) if row["image"] in IMAGE_ORDER else 999
+    )
+    make_overview(coeff_abs_overview, out_dir / "RCP_best_aligned_coeff_abs_overview.png")
     write_summary(out_dir, rows)
     print(f"[done] rows={len(rows)} rcp={len(manifest_rows)} out={out_dir}")
     return 0
