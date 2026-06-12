@@ -298,12 +298,32 @@ DENDRITES_DENSE = first_existing(
     / "data"
     / "dendrites_dense.png",
 )
+USAF_1951 = first_existing(
+    PROJECT_ROOT / "hybrid_ring_cocoa" / "data" / "USAF_1951_wikimedia_3840px_composited.png",
+    PROJECT_ROOT / "outputs" / "cocoa_like_2d_mechanism" / "custom_images" / "USAF_1951_wikimedia_3840px_composited.png",
+)
+LIVE_TARDIGRADE = first_existing(
+    PROJECT_ROOT / "hybrid_ring_cocoa" / "data" / "Live_tardigrade_rawdata_paper_crop_magma.png",
+    PROJECT_ROOT / "outputs" / "cocoa_like_2d_mechanism" / "custom_images" / "Live_tardigrade_rawdata_paper_crop_magma.png",
+)
+LIVER_TISSUE = first_existing(
+    PROJECT_ROOT / "hybrid_ring_cocoa" / "data" / "Liver_tissue_rawdata_paper_crop_magma.png",
+    PROJECT_ROOT / "outputs" / "cocoa_like_2d_mechanism" / "custom_images" / "Liver_tissue_rawdata_paper_crop_magma.png",
+)
+RESOLUTION_TARGET_PAPER = first_existing(
+    PROJECT_ROOT / "hybrid_ring_cocoa" / "data" / "resolution_target_paper_style.png",
+    PROJECT_ROOT / "outputs" / "cocoa_like_2d_mechanism" / "custom_images" / "resolution_target_paper_style.png",
+)
 IMAGE_PATHS = {
     "Test_figure_1": TEST_FIGURE_1,
     "fluorescence": TEST_FIGURE_1,
     "Iksung_beads": IKSUNG_BEADS,
     "dendrites": DENDRITES,
     "dendrites_dense": DENDRITES_DENSE,
+    "USAF_1951": USAF_1951,
+    "Live_tardigrade": LIVE_TARDIGRADE,
+    "Liver_tissue": LIVER_TISSUE,
+    "resolution_target_paper_style": RESOLUTION_TARGET_PAPER,
     "baboon": BABOON,
 }
 
@@ -992,6 +1012,7 @@ def compute_metrics(
         "gt_preset": args.gt_preset,
         "gt_label": args.gt_label,
         "gt_source": args.gt_source,
+        "measurement_direct": bool(getattr(args, "measurement_direct", False)),
         "seidel_convention": args.seidel_convention,
         **metadata_with_fixed_indices(
             args.seidel_convention,
@@ -1465,6 +1486,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Human-readable label for a custom Seidel vector.",
     )
+    ap.add_argument(
+        "--measurement-direct",
+        action="store_true",
+        help=(
+            "Treat the input image itself as the measured image. No synthetic "
+            "measurement is generated and the Seidel vector is only an "
+            "unreferenced equivalent fitted by the model."
+        ),
+    )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--verbose", action="store_true")
     return normalize_nerf_capacity_args(ap, ap.parse_args(argv))
@@ -1491,6 +1521,10 @@ def main() -> None:
         gt_np = preset_for_convention(args.gt_preset, args.seidel_convention)
         args.gt_source = "preset"
         args.gt_label = args.gt_label or args.gt_preset
+    if args.measurement_direct:
+        gt_np = np.zeros_like(gt_np, dtype=np.float32)
+        args.gt_source = "measurement_direct"
+        args.gt_label = args.gt_label or "measurement_direct"
     if args.seidel_rms_floor_weight > 0.0 and args.seidel_rms_floor_target is None:
         args.seidel_rms_floor_target = field_weighted_wavefront_rms_np(gt_np)
     gt_vec = torch.tensor(gt_np, device=device, dtype=torch.float32)
@@ -1509,7 +1543,9 @@ def main() -> None:
 
     sharp_gt = load_baboon_gt(args.size, path=img_path, device=device)
     model_dim = trace_model_dim(args.seidel_convention)
-    if model_dim is None:
+    if args.measurement_direct:
+        meas_gt = sharp_gt.detach().clone()
+    elif model_dim is None:
         meas_gt = synthesize_measurement(sharp_gt, gt_vec, SYS_PARAMS)
     else:
         meas_gt = synthesize_trace_measurement(

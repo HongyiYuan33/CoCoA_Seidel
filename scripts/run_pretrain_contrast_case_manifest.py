@@ -60,10 +60,13 @@ def build_cmd(
     gt_locked_w311_scale: float,
     gt_locked_wd_scale: float,
     gt_locked_atol: float,
+    stage1_size: int,
     pretrain_iter: int,
     joint_iter: int,
+    measurement_direct: bool,
 ) -> list[str]:
     method = row["pretrain_method"]
+    effective_candidate_mode = "measurement_direct" if measurement_direct else candidate_mode
     cmd = [
         python,
         "scripts/run_cocoa_like_seidel_accuracy_sweep.py",
@@ -73,16 +76,12 @@ def build_cmd(
         f"{prefix}__{method}",
         "--images",
         row["image"],
-        "--directions",
-        row["direction"],
-        "--strengths",
-        f"{float(row['target_rms']):.12g}",
         "--seidel-convention",
         seidel_convention,
         "--candidate-mode",
-        candidate_mode,
+        effective_candidate_mode,
         "--stage1-size",
-        "256",
+        str(stage1_size),
         "--stage1-pretrain-iter",
         str(pretrain_iter),
         "--stage1-num-iter",
@@ -138,6 +137,15 @@ def build_cmd(
         "--skip-report",
         "--skip-config-write",
     ]
+    if not measurement_direct:
+        cmd.extend(
+            [
+                "--directions",
+                row["direction"],
+                "--strengths",
+                f"{float(row['target_rms']):.12g}",
+            ]
+        )
     if gt_locked_source_csv is not None:
         cmd.extend(["--gt-locked-source-csv", str(gt_locked_source_csv)])
         cmd.extend(
@@ -164,10 +172,16 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--seidel-convention", default="classical4d")
     parser.add_argument("--candidate-mode", default="direction")
+    parser.add_argument(
+        "--measurement-direct",
+        action="store_true",
+        help="Run one measurement_direct candidate per image and do not pass RMS/direction candidates.",
+    )
     parser.add_argument("--gt-locked-source-csv", type=Path, default=None)
     parser.add_argument("--gt-locked-w311-scale", type=float, default=-0.5)
     parser.add_argument("--gt-locked-wd-scale", type=float, default=0.5)
     parser.add_argument("--gt-locked-atol", type=float, default=1e-7)
+    parser.add_argument("--stage1-size", type=int, default=256)
     parser.add_argument("--stage1-pretrain-iter", type=int, default=400)
     parser.add_argument("--stage1-num-iter", type=int, default=1000)
     parser.add_argument("--dry-run", action="store_true")
@@ -200,8 +214,10 @@ def main() -> int:
             gt_locked_w311_scale=args.gt_locked_w311_scale,
             gt_locked_wd_scale=args.gt_locked_wd_scale,
             gt_locked_atol=args.gt_locked_atol,
+            stage1_size=args.stage1_size,
             pretrain_iter=args.stage1_pretrain_iter,
             joint_iter=args.stage1_num_iter,
+            measurement_direct=args.measurement_direct,
         )
         print(
             f"[case] index={row.get('case_index')} image={row['image']} method={method} "

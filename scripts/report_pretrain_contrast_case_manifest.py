@@ -183,6 +183,27 @@ def run_rcp_builder(
     subprocess.run(cmd, cwd=PROJECT_ROOT, check=True)
 
 
+def run_measurement_direct_rcp_builder(
+    *,
+    python: str,
+    prefix: str,
+    settings_manifest: Path,
+    output_dir: Path,
+) -> None:
+    cmd = [
+        python,
+        "scripts/build_measurement_direct_rcp_stats.py",
+        "--prefix",
+        prefix,
+        "--settings-manifest",
+        str(settings_manifest),
+        "--output-dir",
+        str(output_dir),
+    ]
+    print(f"[measurement-direct-rcp] {output_dir}", flush=True)
+    subprocess.run(cmd, cwd=PROJECT_ROOT, check=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case-manifest", type=Path, default=DEFAULT_LOG_DIR / "case_manifest.csv")
@@ -195,6 +216,11 @@ def main() -> int:
     parser.add_argument("--wait", action="store_true")
     parser.add_argument("--poll-seconds", type=float, default=300.0)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--measurement-direct",
+        action="store_true",
+        help="Skip physical evaluator and render direct-measurement RCP/stats.",
+    )
     args = parser.parse_args()
 
     rows = read_csv(args.case_manifest)
@@ -212,18 +238,26 @@ def main() -> int:
         raise RuntimeError(f"Only {len(done)}/{len(rows)} cases complete")
 
     stage1_paths = write_stage1_metrics(args.output_root, args.prefix, rows)
-    run_evaluators(args.python, stage1_paths, theta_convention=args.theta_convention)
     selected_settings = write_selected_settings(
         load_settings(args.settings_manifest),
         set(stage1_paths),
         args.output_dir / "settings_manifest.selected_for_report.json",
     )
-    run_rcp_builder(
-        python=args.python,
-        prefix=args.prefix,
-        settings_manifest=selected_settings,
-        output_dir=args.output_dir,
-    )
+    if args.measurement_direct:
+        run_measurement_direct_rcp_builder(
+            python=args.python,
+            prefix=args.prefix,
+            settings_manifest=selected_settings,
+            output_dir=args.output_dir,
+        )
+    else:
+        run_evaluators(args.python, stage1_paths, theta_convention=args.theta_convention)
+        run_rcp_builder(
+            python=args.python,
+            prefix=args.prefix,
+            settings_manifest=selected_settings,
+            output_dir=args.output_dir,
+        )
     print(f"[report-done] cases={len(rows)} methods={len(stage1_paths)} out={args.output_dir}", flush=True)
     return 0
 

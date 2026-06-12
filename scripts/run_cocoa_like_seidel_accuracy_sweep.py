@@ -174,6 +174,17 @@ def make_candidates(
     gt_locked_wd_scale: float = 0.5,
     gt_locked_atol: float = 1e-7,
 ) -> list[Candidate]:
+    if candidate_mode == "measurement_direct":
+        return [
+            Candidate(
+                candidate_id="measurement_direct",
+                direction="measurement_direct",
+                target_rms=0.0,
+                seidel=np.zeros(6, dtype=np.float32),
+                actual_rms=0.0,
+                candidate_mode="measurement_direct",
+            )
+        ]
     if candidate_mode == "single_coeff":
         return make_single_coeff_candidates(
             coefficients=coefficients,
@@ -423,6 +434,7 @@ def run_args_for_case(
         gt_label=candidate.candidate_id,
         gt_source="custom",
         fixed_seidel_indices_override=fixed_override,
+        measurement_direct=(candidate.candidate_mode == "measurement_direct"),
         seed=seed,
         verbose=train_verbose,
     )
@@ -484,6 +496,7 @@ def augment_metrics(
             "seed": seed,
             "candidate_id": candidate.candidate_id,
             "direction": candidate.direction,
+            "measurement_direct": candidate.candidate_mode == "measurement_direct",
             "target_wavefront_rms": candidate.target_rms,
             "actual_wavefront_rms": candidate.actual_rms,
             "wavefront_gt_rms": gt_rms,
@@ -552,7 +565,11 @@ def run_case(
     )
     gt_vec = torch.tensor(candidate.seidel, device=device, dtype=torch.float32)
     sharp_gt = cocoa.load_baboon_gt(size, path=cocoa.IMAGE_PATHS[image], device=device)
-    meas_gt = cocoa.synthesize_measurement(sharp_gt, gt_vec, cocoa.SYS_PARAMS)
+    measurement_direct = candidate.candidate_mode == "measurement_direct"
+    if measurement_direct:
+        meas_gt = sharp_gt.detach().clone()
+    else:
+        meas_gt = cocoa.synthesize_measurement(sharp_gt, gt_vec, cocoa.SYS_PARAMS)
 
     print(
         f"[case] {stage} seed={seed} image={image} candidate={candidate.candidate_id} "
@@ -1231,7 +1248,7 @@ def run_stage1_case_subprocess(
                 f"{candidate.active_seidel_value:.12g}",
             ]
         )
-    else:
+    elif candidate.candidate_mode != "measurement_direct":
         cmd.extend(
             [
                 "--directions",
@@ -1332,7 +1349,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--images", nargs="+", choices=sorted(cocoa.IMAGE_PATHS), default=IMAGES)
     parser.add_argument(
         "--candidate-mode",
-        choices=["direction", "single_coeff", "gt_locked_front4"],
+        choices=["direction", "single_coeff", "gt_locked_front4", "measurement_direct"],
         default="direction",
     )
     parser.add_argument("--directions", nargs="+", choices=sorted(DIRECTIONS), default=list(DIRECTIONS))
