@@ -538,6 +538,8 @@ def write_best_and_winner_stats(rows: list[dict[str, Any]], stats_dir: Path) -> 
 def plot_method_metric_means(rows: list[dict[str, Any]], stats_dir: Path) -> None:
     summary = grouped_summary(rows, ["pretrain_method", "method_label"])
     summary.sort(key=lambda row: METHOD_ORDER.index(row["pretrain_method"]))
+    if len(summary) > 80:
+        return
     x = np.arange(len(summary))
     panels = [
         ("operator_error_calibrated_f_mean", "Mean operator error", "lower is better"),
@@ -578,19 +580,20 @@ def plot_pretrain_scatter(rows: list[dict[str, Any]], stats_dir: Path) -> None:
         ax.set_ylabel(label)
         ax.grid(alpha=0.22)
     handles = []
-    for method, idx in colors.items():
-        handles.append(
-            plt.Line2D(
-                [0],
-                [0],
-                marker="o",
-                color="w",
-                label=method,
-                markerfacecolor=cmap(idx % 8),
-                markersize=7,
+    if len(colors) <= 80:
+        for method, idx in colors.items():
+            handles.append(
+                plt.Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    label=method,
+                    markerfacecolor=cmap(idx % 8),
+                    markersize=7,
+                )
             )
-        )
-    axes[-1].legend(handles=handles, fontsize=7, frameon=False, bbox_to_anchor=(1.04, 1.0), loc="upper left")
+        axes[-1].legend(handles=handles, fontsize=7, frameon=False, bbox_to_anchor=(1.04, 1.0), loc="upper left")
     fig.tight_layout()
     fig.savefig(stats_dir / "pretrain_quality_vs_final_metrics.png", dpi=170, bbox_inches="tight")
     plt.close(fig)

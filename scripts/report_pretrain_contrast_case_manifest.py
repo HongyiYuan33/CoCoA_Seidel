@@ -137,7 +137,12 @@ def write_selected_settings(
     return path
 
 
-def run_evaluators(python: str, stage1_paths: dict[str, Path]) -> None:
+def run_evaluators(
+    python: str,
+    stage1_paths: dict[str, Path],
+    *,
+    theta_convention: str,
+) -> None:
     for method, stage1_csv in sorted(stage1_paths.items()):
         out_dir = stage1_csv.parent / "stage1_operator_eval_dim256"
         cmd = [
@@ -148,7 +153,7 @@ def run_evaluators(python: str, stage1_paths: dict[str, Path]) -> None:
             "--dim",
             "256",
             "--theta-convention",
-            "classical4d",
+            theta_convention,
             "--dataset-twin-invariance-pass",
             "true",
             "--resume",
@@ -186,6 +191,7 @@ def main() -> int:
     parser.add_argument("--output-root", type=Path, default=OUTPUT_ROOT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_RCP_DIR)
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--theta-convention", default="classical4d")
     parser.add_argument("--wait", action="store_true")
     parser.add_argument("--poll-seconds", type=float, default=300.0)
     parser.add_argument("--limit", type=int, default=None)
@@ -206,7 +212,7 @@ def main() -> int:
         raise RuntimeError(f"Only {len(done)}/{len(rows)} cases complete")
 
     stage1_paths = write_stage1_metrics(args.output_root, args.prefix, rows)
-    run_evaluators(args.python, stage1_paths)
+    run_evaluators(args.python, stage1_paths, theta_convention=args.theta_convention)
     selected_settings = write_selected_settings(
         load_settings(args.settings_manifest),
         set(stage1_paths),

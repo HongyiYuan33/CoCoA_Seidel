@@ -26,6 +26,12 @@ NEW_RUN = "seidel_even_flip_fixed_oracle_controls_4D_6D_4imgs_2dirs_rms006_020_0
 COEFF_NAMES = ["W040", "W131", "W222", "W220", "W311", "Wd"]
 EVEN_INDICES = [0, 2, 3, 5]
 ODD_INDICES = [1, 4]
+# Recovered-coefficient overlays come from the reference oracle run's combined
+# evaluator CSV; these are the two oracle modes that actually optimize Seidel.
+RECOVERED_MODES = [
+    ("joint_no_RMS", "recovered joint no-RMS (aligned)", "#4C78A8"),
+    ("object_gt_fixed", "recovered object-GT oracle (aligned)", "#9467BD"),
+]
 RESAMPLE_LANCZOS = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.BICUBIC)
 
 
@@ -42,6 +48,33 @@ def parse_vector(value: str | list[float]) -> list[float]:
 def read_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="") as handle:
         return list(csv.DictReader(handle))
+
+
+def l2_distance(a: list[float], b: list[float]) -> float:
+    return float(np.sqrt(sum((x - y) ** 2 for x, y in zip(a, b))))
+
+
+def build_recovered_lookup(old_root: Path) -> dict[tuple[str, str, str, str], dict[str, list[float]]]:
+    path = old_root / "oracle_controls_evaluator_combined.csv"
+    lookup: dict[tuple[str, str, str, str], dict[str, list[float]]] = defaultdict(dict)
+    if not path.is_file():
+        print(f"[warn] recovered-coefficient source missing: {path}", file=sys.stderr)
+        return lookup
+    wanted = {mode for mode, _label, _color in RECOVERED_MODES}
+    for row in read_csv(path):
+        if row.get("oracle_mode") not in wanted:
+            continue
+        raw = row.get("aligned_seidel_physical") or row.get("seidel_final")
+        if not raw:
+            continue
+        key = (
+            row["seidel_convention"],
+            row["image"],
+            row["candidate_id"],
+            str(int(float(row.get("seed") or 0))),
+        )
+        lookup[key][row["oracle_mode"]] = parse_vector(raw)
+    return lookup
 
 
 def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
@@ -99,22 +132,47 @@ def add_panel_title(ax: plt.Axes, title: str, subtitle: str) -> None:
     ax.axis("off")
 
 
-def plot_coefficients(ax: plt.Axes, gt: list[float], even: list[float]) -> None:
+def plot_coefficients(
+    ax: plt.Axes,
+    gt: list[float],
+    even: list[float],
+    recovered: dict[str, list[float]] | None = None,
+) -> None:
     x = np.arange(len(COEFF_NAMES))
-    width = 0.36
-    colors_gt = ["#4C9A8B" if idx in EVEN_INDICES else "#5F6FB3" for idx in range(6)]
-    colors_even = ["#E36C4D" if idx in EVEN_INDICES else "#5F6FB3" for idx in range(6)]
     ax.axhline(0, color="#222222", linewidth=0.7)
-    ax.bar(x - width / 2, gt, width, color=colors_gt, label="GT / GT-fixed")
-    ax.bar(x + width / 2, even, width, color=colors_even, label="even-flip fixed")
+    if not recovered:
+        width = 0.36
+        colors_gt = ["#4C9A8B" if idx in EVEN_INDICES else "#5F6FB3" for idx in range(6)]
+        colors_even = ["#E36C4D" if idx in EVEN_INDICES else "#5F6FB3" for idx in range(6)]
+        ax.bar(x - width / 2, gt, width, color=colors_gt, label="GT / GT-fixed")
+        ax.bar(x + width / 2, even, width, color=colors_even, label="even-flip fixed")
+        legend_fontsize = 8
+    else:
+        series: list[tuple[list[float], str, str]] = [
+            (gt, "GT / GT-fixed", "#4C9A8B"),
+            (even, "even-flip fixed", "#E36C4D"),
+        ]
+        for mode, label, color in RECOVERED_MODES:
+            if mode in recovered:
+                series.append((recovered[mode], label, color))
+        width = 0.8 / len(series)
+        offset0 = -0.4 + width / 2
+        for idx, (values, label, color) in enumerate(series):
+            ax.bar(x + offset0 + idx * width, values, width, color=color, label=label)
+        legend_fontsize = 7
     ax.set_xticks(x, COEFF_NAMES, fontsize=8)
     ax.set_title("Seidel coefficients", fontsize=10)
     ax.set_ylabel("coefficient", fontsize=8)
     ax.grid(axis="y", alpha=0.25)
-    ax.legend(fontsize=8, loc="best")
+    ax.legend(fontsize=legend_fontsize, loc="best")
 
 
-def render_metric_card(ax: plt.Axes, row: dict[str, str], op_row: dict[str, str] | None) -> None:
+def render_metric_card(
+    ax: plt.Axes,
+    row: dict[str, str],
+    op_row: dict[str, str] | None,
+    recovered: dict[str, list[float]] | None = None,
+) -> None:
     ax.axis("off")
     lines = [
         "Metric card",
@@ -136,15 +194,35 @@ def render_metric_card(ax: plt.Axes, row: dict[str, str], op_row: dict[str, str]
                 f"best physical transform: {op_row['best_physical_transform']}",
             ]
         )
+    fontsize = 9.0
+    linespacing = 1.35
+    if recovered is not None:
+        fontsize = 8.0
+        linespacing = 1.25
+        if recovered:
+            gt = parse_vector(row["seidel_gt"])
+            even = parse_vector(row["even_flip_seidel"])
+            for mode, _label, _color in RECOVERED_MODES:
+                vec = recovered.get(mode)
+                if vec is None:
+                    continue
+                d_gt = l2_distance(vec, gt)
+                d_even = l2_distance(vec, even)
+                verdict = "GT" if d_gt <= d_even else "even-flip"
+                lines.append(
+                    f"rec {mode}: L2gt={d_gt:.3f} L2flip={d_even:.3f} -> {verdict}"
+                )
+        else:
+            lines.append("recovered: n/a")
     ax.text(
         0.02,
         0.96,
         "\n".join(lines),
         va="top",
         ha="left",
-        fontsize=9,
+        fontsize=fontsize,
         family="monospace",
-        linespacing=1.35,
+        linespacing=linespacing,
     )
 
 
@@ -172,6 +250,7 @@ def build_case_rcp(
     new_root: Path,
     out_root: Path,
     operator_lookup: dict[tuple[str, str, str, str], dict[str, str]],
+    recovered_lookup: dict[tuple[str, str, str, str], dict[str, list[float]]] | None = None,
 ) -> Path | None:
     old_png = old_comparison_path(old_root, row)
     new_png = new_comparison_path(new_root, row)
@@ -188,6 +267,11 @@ def build_case_rcp(
     op_row = operator_lookup.get(key)
     gt = parse_vector(row["seidel_gt"])
     even = parse_vector(row["even_flip_seidel"])
+    recovered: dict[str, list[float]] | None = None
+    if recovered_lookup is not None:
+        recovered = recovered_lookup.get(key, {})
+        if not recovered:
+            print(f"[warn] no recovered coefficients for {key}", file=sys.stderr)
 
     fig = plt.figure(figsize=(17, 10.5))
     grid = fig.add_gridspec(3, 2, height_ratios=[0.08, 0.66, 0.26], hspace=0.22, wspace=0.08)
@@ -221,8 +305,8 @@ def build_case_rcp(
     )
     coeff_ax = fig.add_subplot(grid[2, 0])
     card_ax = fig.add_subplot(grid[2, 1])
-    plot_coefficients(coeff_ax, gt, even)
-    render_metric_card(card_ax, row, op_row)
+    plot_coefficients(coeff_ax, gt, even, recovered=recovered)
+    render_metric_card(card_ax, row, op_row, recovered=recovered)
     out_path = output_case_path(out_root, row)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
@@ -446,7 +530,7 @@ def build_contact_sheets(rows: list[dict[str, str]], rcp_paths: dict[tuple[str, 
             )
 
 
-def write_readme(out_root: Path, generated: list[Path]) -> None:
+def write_readme(out_root: Path, generated: list[Path], *, include_recovered: bool = False) -> None:
     lines = [
         "# Even-Flip vs GT-Fixed RCP Comparison",
         "",
@@ -462,6 +546,18 @@ def write_readme(out_root: Path, generated: list[Path]) -> None:
         f"Generated per-case RCPs: {len(generated)}",
         "",
     ]
+    if include_recovered:
+        insert_at = lines.index("Key folders:")
+        lines[insert_at:insert_at] = [
+            "The coefficient bar chart additionally overlays the *recovered* Seidel vectors",
+            "(`aligned_seidel_physical`) from the reference oracle run's",
+            "`oracle_controls_evaluator_combined.csv`:",
+            "- `joint_no_RMS` (blue): free joint recovery, nothing fixed.",
+            "- `object_gt_fixed` (purple): object fixed to sharp GT, Seidel recovered.",
+            "The metric card reports each recovered vector's coefficient L2 to GT and to the",
+            "even-flip twin, with a `closer to` verdict per mode.",
+            "",
+        ]
     write_csv(
         [{"path": str(path.relative_to(out_root))} for path in generated],
         out_root / "manifest.csv",
@@ -474,6 +570,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--old-root", type=Path, default=OUTPUT_BASE / OLD_RUN)
     parser.add_argument("--new-root", type=Path, default=OUTPUT_BASE / NEW_RUN)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument(
+        "--include-recovered",
+        action="store_true",
+        help=(
+            "Overlay recovered Seidel coefficients (joint_no_RMS and object_gt_fixed "
+            "modes from the old run's combined evaluator CSV) on the coefficient bars; "
+            "writes to RCP_even_flip_vs_gt_fixed_with_recovered by default."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -481,10 +586,16 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     old_root = args.old_root
     new_root = args.new_root
-    out_root = args.output_dir or (new_root / "RCP_even_flip_vs_gt_fixed")
+    default_name = (
+        "RCP_even_flip_vs_gt_fixed_with_recovered"
+        if args.include_recovered
+        else "RCP_even_flip_vs_gt_fixed"
+    )
+    out_root = args.output_dir or (new_root / default_name)
     comparison_csv = new_root / "comparison_vs_seidel_gt_fixed.csv"
     rows = read_csv(comparison_csv)
     operator_lookup = build_operator_lookup(new_root)
+    recovered_lookup = build_recovered_lookup(old_root) if args.include_recovered else None
     generated: list[Path] = []
     rcp_paths: dict[tuple[str, str, str, int], Path] = {}
     for row in rows:
@@ -494,6 +605,7 @@ def main(argv: list[str] | None = None) -> None:
             new_root=new_root,
             out_root=out_root,
             operator_lookup=operator_lookup,
+            recovered_lookup=recovered_lookup,
         )
         if out_path is None:
             print(f"[missing] {row['seidel_convention']} {row['image']} {row['candidate_id']}", file=sys.stderr)
@@ -503,7 +615,7 @@ def main(argv: list[str] | None = None) -> None:
         rcp_paths[key] = out_path
     build_contact_sheets(rows, rcp_paths, out_root)
     build_stats(rows, new_root, out_root)
-    write_readme(out_root, generated)
+    write_readme(out_root, generated, include_recovered=args.include_recovered)
     print(f"[done] generated_rcps={len(generated)} output={out_root}")
 
 

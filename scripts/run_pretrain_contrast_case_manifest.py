@@ -54,11 +54,17 @@ def build_cmd(
     prefix: str,
     row: dict[str, str],
     setting: dict[str, Any],
+    seidel_convention: str,
+    candidate_mode: str,
+    gt_locked_source_csv: Path | None,
+    gt_locked_w311_scale: float,
+    gt_locked_wd_scale: float,
+    gt_locked_atol: float,
     pretrain_iter: int,
     joint_iter: int,
 ) -> list[str]:
     method = row["pretrain_method"]
-    return [
+    cmd = [
         python,
         "scripts/run_cocoa_like_seidel_accuracy_sweep.py",
         "--stage",
@@ -72,7 +78,9 @@ def build_cmd(
         "--strengths",
         f"{float(row['target_rms']):.12g}",
         "--seidel-convention",
-        "classical4d",
+        seidel_convention,
+        "--candidate-mode",
+        candidate_mode,
         "--stage1-size",
         "256",
         "--stage1-pretrain-iter",
@@ -130,6 +138,19 @@ def build_cmd(
         "--skip-report",
         "--skip-config-write",
     ]
+    if gt_locked_source_csv is not None:
+        cmd.extend(["--gt-locked-source-csv", str(gt_locked_source_csv)])
+        cmd.extend(
+            [
+                "--gt-locked-w311-scale",
+                str(gt_locked_w311_scale),
+                "--gt-locked-wd-scale",
+                str(gt_locked_wd_scale),
+                "--gt-locked-atol",
+                str(gt_locked_atol),
+            ]
+        )
+    return cmd
 
 
 def main() -> int:
@@ -141,6 +162,12 @@ def main() -> int:
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--seidel-convention", default="classical4d")
+    parser.add_argument("--candidate-mode", default="direction")
+    parser.add_argument("--gt-locked-source-csv", type=Path, default=None)
+    parser.add_argument("--gt-locked-w311-scale", type=float, default=-0.5)
+    parser.add_argument("--gt-locked-wd-scale", type=float, default=0.5)
+    parser.add_argument("--gt-locked-atol", type=float, default=1e-7)
     parser.add_argument("--stage1-pretrain-iter", type=int, default=400)
     parser.add_argument("--stage1-num-iter", type=int, default=1000)
     parser.add_argument("--dry-run", action="store_true")
@@ -167,6 +194,12 @@ def main() -> int:
             prefix=args.prefix,
             row=row,
             setting=settings[method],
+            seidel_convention=args.seidel_convention,
+            candidate_mode=args.candidate_mode,
+            gt_locked_source_csv=args.gt_locked_source_csv,
+            gt_locked_w311_scale=args.gt_locked_w311_scale,
+            gt_locked_wd_scale=args.gt_locked_wd_scale,
+            gt_locked_atol=args.gt_locked_atol,
             pretrain_iter=args.stage1_pretrain_iter,
             joint_iter=args.stage1_num_iter,
         )
