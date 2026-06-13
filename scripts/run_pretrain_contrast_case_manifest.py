@@ -39,6 +39,25 @@ def setting_float(setting: dict[str, Any], key: str, default: float) -> str:
     return str(float(setting.get(key, default)))
 
 
+def row_int(row: dict[str, str], key: str, default: int) -> int:
+    value = row.get(key, "")
+    if value in {"", None}:  # type: ignore[comparison-overlap]
+        return int(default)
+    return int(float(value))
+
+
+def optional_setting_value(
+    *,
+    row: dict[str, str],
+    setting: dict[str, Any],
+    key: str,
+) -> Any:
+    value = row.get(key, "")
+    if value not in {"", None}:  # type: ignore[comparison-overlap]
+        return value
+    return setting.get(key)
+
+
 def case_items(rows: list[dict[str, str]], *, shard_index: int, num_shards: int) -> list[dict[str, str]]:
     out = []
     for offset, row in enumerate(rows):
@@ -63,10 +82,30 @@ def build_cmd(
     stage1_size: int,
     pretrain_iter: int,
     joint_iter: int,
+    default_second_joint_iter: int,
+    override_second_joint_iter: int | None,
+    default_post_joint_pretrain_iter: int,
+    override_post_joint_pretrain_iter: int | None,
+    default_post_joint_pretrain_scalar: float | None,
     measurement_direct: bool,
 ) -> list[str]:
     method = row["pretrain_method"]
     effective_candidate_mode = "measurement_direct" if measurement_direct else candidate_mode
+    second_joint_iter = (
+        int(override_second_joint_iter)
+        if override_second_joint_iter is not None
+        else row_int(row, "second_joint_iter", default_second_joint_iter)
+    )
+    post_joint_pretrain_iter = (
+        int(override_post_joint_pretrain_iter)
+        if override_post_joint_pretrain_iter is not None
+        else row_int(row, "post_joint_pretrain_iter", default_post_joint_pretrain_iter)
+    )
+    post_joint_pretrain_scalar = row.get("post_joint_pretrain_scalar", "")
+    if post_joint_pretrain_scalar in {"", None}:  # type: ignore[comparison-overlap]
+        post_joint_pretrain_scalar_value = default_post_joint_pretrain_scalar
+    else:
+        post_joint_pretrain_scalar_value = float(post_joint_pretrain_scalar)
     cmd = [
         python,
         "scripts/run_cocoa_like_seidel_accuracy_sweep.py",
@@ -86,6 +125,10 @@ def build_cmd(
         str(pretrain_iter),
         "--stage1-num-iter",
         str(joint_iter),
+        "--second-joint-iter",
+        str(second_joint_iter),
+        "--post-joint-pretrain-iter",
+        str(post_joint_pretrain_iter),
         "--lr-obj",
         "0.005",
         "--lr-seidel",
@@ -137,6 +180,38 @@ def build_cmd(
         "--skip-report",
         "--skip-config-write",
     ]
+    if post_joint_pretrain_scalar_value is not None:
+        cmd.extend(["--post-joint-pretrain-scalar", str(float(post_joint_pretrain_scalar_value))])
+    post_source = optional_setting_value(
+        row=row,
+        setting=setting,
+        key="post_joint_pretrain_source",
+    )
+    if post_source not in {"", None}:  # type: ignore[comparison-overlap]
+        cmd.extend(["--post-joint-pretrain-source", str(post_source)])
+    post_target_transform = optional_setting_value(
+        row=row,
+        setting=setting,
+        key="post_joint_pretrain_target_transform",
+    )
+    if post_target_transform not in {"", None}:  # type: ignore[comparison-overlap]
+        cmd.extend(["--post-joint-pretrain-target-transform", str(post_target_transform)])
+    for key, flag in [
+        ("post_joint_object_init", "--post-joint-object-init"),
+    ]:
+        value = optional_setting_value(row=row, setting=setting, key=key)
+        if value not in {"", None}:  # type: ignore[comparison-overlap]
+            cmd.extend([flag, str(value)])
+    for key, flag in [
+        ("post_joint_pretrain_contrast_alpha", "--post-joint-pretrain-contrast-alpha"),
+        ("post_joint_pretrain_percentile_lo", "--post-joint-pretrain-percentile-lo"),
+        ("post_joint_pretrain_percentile_hi", "--post-joint-pretrain-percentile-hi"),
+        ("post_joint_pretrain_gamma", "--post-joint-pretrain-gamma"),
+        ("post_joint_pretrain_rsd_weight", "--post-joint-pretrain-rsd-weight"),
+    ]:
+        value = optional_setting_value(row=row, setting=setting, key=key)
+        if value not in {"", None}:  # type: ignore[comparison-overlap]
+            cmd.extend([flag, str(float(value))])
     if not measurement_direct:
         cmd.extend(
             [
@@ -184,6 +259,21 @@ def main() -> int:
     parser.add_argument("--stage1-size", type=int, default=256)
     parser.add_argument("--stage1-pretrain-iter", type=int, default=400)
     parser.add_argument("--stage1-num-iter", type=int, default=1000)
+    parser.add_argument("--default-second-joint-iter", type=int, default=0)
+    parser.add_argument(
+        "--override-second-joint-iter",
+        type=int,
+        default=None,
+        help="Force every manifest row to use this second-joint iteration count.",
+    )
+    parser.add_argument("--default-post-joint-pretrain-iter", type=int, default=0)
+    parser.add_argument(
+        "--override-post-joint-pretrain-iter",
+        type=int,
+        default=None,
+        help="Force every manifest row to use this post-joint pretrain iteration count.",
+    )
+    parser.add_argument("--default-post-joint-pretrain-scalar", type=float, default=None)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -191,6 +281,17 @@ def main() -> int:
         raise ValueError("--num-shards must be >= 1")
     if args.shard_index < 0 or args.shard_index >= args.num_shards:
         raise ValueError("--shard-index must be in [0, --num-shards)")
+    if args.default_second_joint_iter < 0:
+        raise ValueError("--default-second-joint-iter must be non-negative")
+    if args.override_second_joint_iter is not None and args.override_second_joint_iter < 0:
+        raise ValueError("--override-second-joint-iter must be non-negative")
+    if args.default_post_joint_pretrain_iter < 0:
+        raise ValueError("--default-post-joint-pretrain-iter must be non-negative")
+    if (
+        args.override_post_joint_pretrain_iter is not None
+        and args.override_post_joint_pretrain_iter < 0
+    ):
+        raise ValueError("--override-post-joint-pretrain-iter must be non-negative")
 
     settings = load_settings(args.settings_manifest)
     rows = case_items(read_csv(args.case_manifest), shard_index=args.shard_index, num_shards=args.num_shards)
@@ -217,6 +318,11 @@ def main() -> int:
             stage1_size=args.stage1_size,
             pretrain_iter=args.stage1_pretrain_iter,
             joint_iter=args.stage1_num_iter,
+            default_second_joint_iter=args.default_second_joint_iter,
+            override_second_joint_iter=args.override_second_joint_iter,
+            default_post_joint_pretrain_iter=args.default_post_joint_pretrain_iter,
+            override_post_joint_pretrain_iter=args.override_post_joint_pretrain_iter,
+            default_post_joint_pretrain_scalar=args.default_post_joint_pretrain_scalar,
             measurement_direct=args.measurement_direct,
         )
         print(

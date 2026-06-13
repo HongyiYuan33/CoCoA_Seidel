@@ -754,6 +754,26 @@ def make_rcp(row: dict[str, Any], *, output_root: Path, prefix: str, out_dir: Pa
     gain = float(metrics.get("best_gain_recon_to_gt", 1.0))
     recon_gain = recon * gain
     err = np.abs(recon_gain - gt)
+    first_recon_tensor = tensors.get("first_joint_sharp_recon")
+    first_recon = as_array(first_recon_tensor) if first_recon_tensor is not None else None
+    first_recon_percentile_tensor = tensors.get("first_joint_recon_percentile")
+    first_recon_percentile = (
+        as_array(first_recon_percentile_tensor)
+        if first_recon_percentile_tensor is not None
+        else None
+    )
+    post_joint_render_tensor = tensors.get("post_joint_pretrain_render")
+    post_joint_render = (
+        as_array(post_joint_render_tensor) if post_joint_render_tensor is not None else None
+    )
+    post_joint_source_tensor = tensors.get("post_joint_pretrain_source")
+    post_joint_source = (
+        as_array(post_joint_source_tensor) if post_joint_source_tensor is not None else None
+    )
+    post_joint_target_tensor = tensors.get("post_joint_pretrain_target")
+    post_joint_target = (
+        as_array(post_joint_target_tensor) if post_joint_target_tensor is not None else None
+    )
 
     seidel_gt = parse_vector(row["seidel_gt"])
     seidel_raw = parse_vector(row["seidel_final"])
@@ -772,35 +792,60 @@ def make_rcp(row: dict[str, Any], *, output_root: Path, prefix: str, out_dir: Pa
     )
     out_path = out_subdir / filename
 
-    fig = plt.figure(figsize=(20.8, 7.9), dpi=145)
+    has_first_joint_recon = first_recon is not None and first_recon.shape == recon.shape
+    has_post_joint_source = post_joint_source is not None and post_joint_source.shape == recon.shape
+    has_post_joint_target = post_joint_target is not None and post_joint_target.shape == recon.shape
+    has_post_joint_render = post_joint_render is not None and post_joint_render.shape == recon.shape
+    has_intermediate_object = has_first_joint_recon or has_post_joint_source or has_post_joint_render
+    left_rows = 4 if has_intermediate_object else 3
+    fig_height = 10.05 if has_intermediate_object else 7.9
+    fig = plt.figure(figsize=(20.8, fig_height), dpi=145)
     outer = fig.add_gridspec(
         1,
         2,
         width_ratios=[1.08, 1.0],
         left=0.024,
         right=0.987,
-        top=0.925,
-        bottom=0.065,
+        top=0.932 if has_intermediate_object else 0.925,
+        bottom=0.050 if has_intermediate_object else 0.065,
         wspace=0.055,
     )
-    left = outer[0, 0].subgridspec(3, 3, wspace=0.08, hspace=0.20)
+    left = outer[0, 0].subgridspec(left_rows, 3, wspace=0.08, hspace=0.20)
     image_items = [
         ("Sharp GT", gt, "gray", normalize01),
         ("Measurement", meas, "gray", normalize01),
         ("Pretrain target", pre_target, "gray", percentile01),
         ("Pretrain render", pre_render, "gray", percentile01),
         ("Pretrain abs error", pre_error, "magma", percentile01),
-        ("Recon raw clipped", recon, "gray", normalize01),
-        ("Recon percentile", recon, "gray", percentile01),
-        ("Predicted measurement", pred, "gray", normalize01),
-        ("Final gain-aligned abs error", err, "magma", percentile01),
     ]
+    if has_post_joint_source and row.get("post_joint_pretrain_source") == "first_joint_object_raw":
+        source_display = first_recon_percentile if first_recon_percentile is not None else post_joint_source
+        image_items.append(("First joint recon percentile / post target source", source_display, "gray", normalize01))
+    elif has_post_joint_source:
+        image_items.append(("First joint object raw clipped / post source", post_joint_source, "gray", normalize01))
+    elif has_first_joint_recon:
+        image_items.append(("First joint recon percentile", first_recon, "gray", percentile01))
+    if has_post_joint_target:
+        image_items.append(("Post-joint pretrain target", post_joint_target, "gray", percentile01))
+    if has_post_joint_render:
+        image_items.append(("Post-joint pretrain render", post_joint_render, "gray", percentile01))
+    image_items.extend(
+        [
+            ("Recon raw clipped", recon, "gray", normalize01),
+            ("Recon percentile", recon, "gray", percentile01),
+            ("Predicted measurement", pred, "gray", normalize01),
+            ("Final gain-aligned abs error", err, "magma", percentile01),
+        ]
+    )
     for idx, (title, arr, cmap, norm_fn) in enumerate(image_items):
         ax = fig.add_subplot(left[idx // 3, idx % 3])
         ax.imshow(norm_fn(arr), cmap=cmap, vmin=0.0, vmax=1.0)
         ax.set_title(title, fontsize=8.8, pad=3)
         ax.set_xticks([])
         ax.set_yticks([])
+    for idx in range(len(image_items), left_rows * 3):
+        ax = fig.add_subplot(left[idx // 3, idx % 3])
+        ax.axis("off")
 
     fig.text(
         0.275,
@@ -850,8 +895,29 @@ def make_rcp(row: dict[str, Any], *, output_root: Path, prefix: str, out_dir: Pa
             f"coeff_rel={short_float(row['aligned_coeff_relative_error_physical_f'])} | "
             f"best_phys={row.get('best_physical_transform', '?')}"
         ),
-        wrapped(f"case={image}__{candidate}", width=96),
     ]
+    if has_first_joint_recon:
+        lines.append(
+            "first joint object: "
+            f"SSIM={short_float(parse_float(row, 'first_joint_ssim_recon_gain_vs_gt'))} | "
+            f"NRMSE={short_float(parse_float(row, 'first_joint_nrmse_recon_gain_vs_gt'))}"
+        )
+    if has_post_joint_render:
+        lines.append(
+            "post-joint pretrain: "
+            f"source={row.get('post_joint_pretrain_source', '?')} | "
+            f"object_init={row.get('post_joint_object_init', '?')} | "
+            f"target={row.get('post_joint_pretrain_target_transform', '?')} | "
+            f"scalar={row.get('post_joint_pretrain_scalar', '?')} | "
+            f"p=({row.get('post_joint_pretrain_percentile_lo', '?')},{row.get('post_joint_pretrain_percentile_hi', '?')}) | "
+            f"gamma={row.get('post_joint_pretrain_gamma', '?')}"
+        )
+        lines.append(
+            "post-joint fit: "
+            f"loss={short_float(parse_float(row, 'post_joint_pretrain_final_loss'))} | "
+            f"NRMSE={short_float(parse_float(row, 'post_joint_pretrain_render_nrmse_vs_target'))}"
+        )
+    lines.append(wrapped(f"case={image}__{candidate}", width=96))
     ax_text.text(0.0, 0.98, title, ha="left", va="top", fontsize=10.7, fontweight="bold")
     ax_text.text(0.0, 0.75, "\n".join(lines), ha="left", va="top", fontsize=8.4)
 

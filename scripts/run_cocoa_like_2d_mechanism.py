@@ -1221,6 +1221,7 @@ def run_one_mode(
     print(
         f"[start] mode={mode} image={args.image} size={args.size} "
         f"device={device} pretrain={args.pretrain_iter} joint={args.num_iter} "
+        f"second_joint={args.second_joint_iter} "
         f"mlp={args.nerf_depth}x{args.nerf_width} "
         f"skips={format_nerf_skips(args.nerf_skips)} "
         f"seidel_optimizer={args.seidel_optimizer} "
@@ -1262,7 +1263,7 @@ def run_one_mode(
         pretrain_render = net_obj.render(*meas_gt.shape).detach()
         pretrain_target = pretrain_details.target.detach()
         pretrain_abs_error = torch.abs(pretrain_render - pretrain_target).detach()
-    result = train_cocoa_like(
+    first_result = train_cocoa_like(
         net_obj,
         seidel,
         meas_gt,
@@ -1288,8 +1289,206 @@ def run_one_mode(
         pretrain_history=pretrain_history,
         verbose=args.verbose,
     )
-    result = result._replace(elapsed_s=time.time() - t0)
+    first_result = first_result._replace(elapsed_s=time.time() - t0)
+    first_metrics = compute_metrics(sharp_gt, meas_gt, first_result, gt_np, mode=mode, args=args)
+
+    post_joint_pretrain_details: PretrainDetails | None = None
+    post_joint_pretrain_render: torch.Tensor | None = None
+    post_joint_pretrain_target: torch.Tensor | None = None
+    post_joint_pretrain_abs_error: torch.Tensor | None = None
+    post_joint_pretrain_scalar = (
+        float(args.post_joint_pretrain_scalar)
+        if args.post_joint_pretrain_scalar is not None
+        else float(args.pretrain_scalar)
+    )
+    post_joint_pretrain_source_name = str(args.post_joint_pretrain_source)
+    if post_joint_pretrain_source_name == "measurement_gt":
+        post_joint_pretrain_source_tensor = meas_gt
+    elif post_joint_pretrain_source_name == "first_joint_object_raw_clipped":
+        post_joint_pretrain_source_tensor = first_result.sharp_final.detach().clamp(0.0, 1.0)
+    elif post_joint_pretrain_source_name == "first_joint_object_raw":
+        post_joint_pretrain_source_tensor = first_result.sharp_final.detach()
+    else:
+        raise ValueError(f"Unknown post-joint pretrain source: {post_joint_pretrain_source_name!r}")
+    first_joint_recon_percentile = globals()["pretrain_target_transform"](
+        first_result.sharp_final.detach(),
+        measurement_scalar=1.0,
+        target_transform="percentile_gamma",
+        contrast_alpha=1.0,
+        percentile_lo=0.5,
+        percentile_hi=99.5,
+        gamma=1.0,
+    ).detach()
+    post_joint_object_init = str(args.post_joint_object_init)
+    post_joint_pretrain_target_transform = (
+        args.post_joint_pretrain_target_transform
+        if args.post_joint_pretrain_target_transform is not None
+        else pretrain_target_transform
+    )
+    post_joint_pretrain_contrast_alpha = (
+        float(args.post_joint_pretrain_contrast_alpha)
+        if args.post_joint_pretrain_contrast_alpha is not None
+        else float(pretrain_contrast_alpha)
+    )
+    post_joint_pretrain_percentile_lo = (
+        float(args.post_joint_pretrain_percentile_lo)
+        if args.post_joint_pretrain_percentile_lo is not None
+        else float(pretrain_percentile_lo)
+    )
+    post_joint_pretrain_percentile_hi = (
+        float(args.post_joint_pretrain_percentile_hi)
+        if args.post_joint_pretrain_percentile_hi is not None
+        else float(pretrain_percentile_hi)
+    )
+    post_joint_pretrain_gamma = (
+        float(args.post_joint_pretrain_gamma)
+        if args.post_joint_pretrain_gamma is not None
+        else float(pretrain_gamma)
+    )
+    post_joint_pretrain_rsd_weight = (
+        float(args.post_joint_pretrain_rsd_weight)
+        if args.post_joint_pretrain_rsd_weight is not None
+        else float(pretrain_rsd_weight)
+    )
+
+    result = first_result
+    if mode == "joint" and int(args.second_joint_iter) > 0:
+        if post_joint_object_init == "reset_fresh_same_seed":
+            torch.manual_seed(args.seed)
+            np.random.seed(args.seed)
+            net_obj = CocoaLikeObject2D(
+                max_val=args.max_val,
+                beta=args.nerf_beta,
+                output_mode=args.output_mode,
+                depth=args.nerf_depth,
+                width=args.nerf_width,
+                skips=args.nerf_skips,
+                fourier_num_angles=args.fourier_num_angles,
+                fourier_num_octaves=args.fourier_num_octaves,
+            ).to(device)
+        elif post_joint_object_init != "inherit":
+            raise ValueError(f"Unknown post_joint_object_init={post_joint_object_init!r}")
+        with torch.no_grad():
+            post_joint_pretrain_initial_render = net_obj.render(*meas_gt.shape).detach()
+        if int(args.post_joint_pretrain_iter) > 0:
+            print(
+                f"[post-joint pretrain start] mode={mode} image={args.image} "
+                f"iter={args.post_joint_pretrain_iter} scalar={post_joint_pretrain_scalar:g} "
+                f"source={post_joint_pretrain_source_name} object_init={post_joint_object_init} "
+                f"target={post_joint_pretrain_target_transform} "
+                f"p=({post_joint_pretrain_percentile_lo:g},{post_joint_pretrain_percentile_hi:g}) "
+                f"gamma={post_joint_pretrain_gamma:g} rsd={post_joint_pretrain_rsd_weight:g}",
+                flush=True,
+            )
+            post_details = pretrain_cocoa_like(
+                net_obj,
+                post_joint_pretrain_source_tensor,
+                num_iter=args.post_joint_pretrain_iter,
+                lr=args.lr_obj,
+                measurement_scalar=post_joint_pretrain_scalar,
+                target_transform=post_joint_pretrain_target_transform,
+                contrast_alpha=post_joint_pretrain_contrast_alpha,
+                percentile_lo=post_joint_pretrain_percentile_lo,
+                percentile_hi=post_joint_pretrain_percentile_hi,
+                gamma=post_joint_pretrain_gamma,
+                pretrain_rsd_weight=post_joint_pretrain_rsd_weight,
+                pretrain_edge_weight=pretrain_edge_weight,
+                pretrain_edge_mode=pretrain_edge_mode,
+                return_details=True,
+                verbose=args.verbose,
+            )
+            assert isinstance(post_details, PretrainDetails)
+            post_joint_pretrain_details = post_details
+            with torch.no_grad():
+                post_joint_pretrain_render = net_obj.render(*meas_gt.shape).detach()
+                post_joint_pretrain_target = post_details.target.detach()
+                post_joint_pretrain_abs_error = torch.abs(
+                    post_joint_pretrain_render - post_joint_pretrain_target
+                ).detach()
+        dim = int(trace_model_dim(args.seidel_convention) or 6)
+        second_seidel = nn.Parameter(torch.zeros(dim, device=device, dtype=sharp_gt.dtype))
+        print(
+            f"[second-joint start] mode={mode} image={args.image} "
+            f"iter={args.second_joint_iter} reset_seidel=zeros object_init={post_joint_object_init}",
+            flush=True,
+        )
+        second_result = train_cocoa_like(
+            net_obj,
+            second_seidel,
+            meas_gt,
+            SYS_PARAMS,
+            mode=f"{mode}_second",
+            num_iter=args.second_joint_iter,
+            lr_obj=args.lr_obj,
+            lr_seidel=args.lr_seidel,
+            seidel_optimizer=args.seidel_optimizer,
+            rsd_weight=args.rsd_weight,
+            tv_weight=args.tv_weight,
+            defocus_anchor_weight=args.defocus_anchor_weight,
+            defocus_index=args.defocus_index,
+            seidel_model_dim=trace_model_dim(args.seidel_convention),
+            fixed_seidel_indices=resolved_fixed_seidel_indices(args),
+            scheduler=args.scheduler,
+            eta_min_ratio=args.eta_min_ratio,
+            seidel_rms_floor_weight=args.seidel_rms_floor_weight,
+            seidel_rms_floor_alpha=args.seidel_rms_floor_alpha,
+            seidel_rms_floor_target=args.seidel_rms_floor_target,
+            seidel_rms_floor_field_samples=args.seidel_rms_floor_field_samples,
+            seidel_rms_floor_pupil_samples=args.seidel_rms_floor_pupil_samples,
+            pretrain_history=pretrain_history
+            + (
+                post_joint_pretrain_details.loss_history
+                if post_joint_pretrain_details is not None
+                else []
+            ),
+            verbose=args.verbose,
+        )
+        result = second_result._replace(elapsed_s=time.time() - t0)
+    else:
+        result = result._replace(elapsed_s=time.time() - t0)
     metrics = compute_metrics(sharp_gt, meas_gt, result, gt_np, mode=mode, args=args)
+    first_metric_keys = [
+        "elapsed_s",
+        "final_loss",
+        "final_ssim_loss",
+        "final_rsd_loss",
+        "final_tv_loss",
+        "best_gain_recon_to_gt",
+        "nrmse_recon_raw_vs_gt",
+        "nrmse_recon_gain_vs_gt",
+        "nrmse_meas_pred_vs_meas",
+        "ssim_recon_raw_vs_gt",
+        "ssim_recon_gain_vs_gt",
+        "msssim_recon_gain_vs_gt",
+        "ssim_meas_pred_vs_meas",
+        "l2_seidel_vs_gt",
+        "seidel_final",
+    ]
+    metrics.update(
+        {
+            "second_joint_enabled": bool(mode == "joint" and int(args.second_joint_iter) > 0),
+            "second_joint_iter": int(args.second_joint_iter),
+            "first_joint_iter": int(args.num_iter),
+            "first_joint_reset_seidel_for_second": bool(mode == "joint" and int(args.second_joint_iter) > 0),
+            "second_joint_object_optimizer_state": "reinitialized_adam",
+            "second_joint_seidel_init": "zeros",
+            "post_joint_pretrain_enabled": bool(post_joint_pretrain_details is not None),
+            "post_joint_pretrain_iter": int(args.post_joint_pretrain_iter),
+            "post_joint_pretrain_source": post_joint_pretrain_source_name,
+            "post_joint_pretrain_scalar": post_joint_pretrain_scalar,
+            "post_joint_pretrain_target_transform": post_joint_pretrain_target_transform,
+            "post_joint_pretrain_contrast_alpha": post_joint_pretrain_contrast_alpha,
+            "post_joint_pretrain_percentile_lo": post_joint_pretrain_percentile_lo,
+            "post_joint_pretrain_percentile_hi": post_joint_pretrain_percentile_hi,
+            "post_joint_pretrain_gamma": post_joint_pretrain_gamma,
+            "post_joint_pretrain_rsd_weight": post_joint_pretrain_rsd_weight,
+            "post_joint_object_init": post_joint_object_init,
+            "post_joint_pretrain_object_optimizer_state": (
+                "reinitialized_adam" if post_joint_pretrain_details is not None else None
+            ),
+            **{f"first_joint_{key}": first_metrics.get(key) for key in first_metric_keys},
+        }
+    )
     pretrain_render_np = pretrain_render.detach().cpu().numpy()
     pretrain_target_np = pretrain_target.detach().cpu().numpy()
     metrics.update(
@@ -1332,6 +1531,7 @@ def run_one_mode(
                 pretrain_render_np,
             ),
             "pretrain_render_hf_ratio": high_frequency_ratio(pretrain_render_np),
+            "pretrain_scalar": float(args.pretrain_scalar),
             "pretrain_target_transform": pretrain_target_transform,
             "pretrain_contrast_alpha": float(pretrain_contrast_alpha),
             "pretrain_percentile_lo": float(pretrain_percentile_lo),
@@ -1342,32 +1542,97 @@ def run_one_mode(
             "pretrain_edge_mode": pretrain_edge_mode,
         }
     )
+    if post_joint_pretrain_details is not None:
+        assert post_joint_pretrain_render is not None
+        assert post_joint_pretrain_target is not None
+        post_render_np = post_joint_pretrain_render.detach().cpu().numpy()
+        post_target_np = post_joint_pretrain_target.detach().cpu().numpy()
+        metrics.update(
+            {
+                "post_joint_pretrain_final_loss": (
+                    float(post_joint_pretrain_details.loss_history[-1])
+                    if post_joint_pretrain_details.loss_history
+                    else float("nan")
+                ),
+                "post_joint_pretrain_final_ssim_loss": (
+                    float(post_joint_pretrain_details.ssim_history[-1])
+                    if post_joint_pretrain_details.ssim_history
+                    else float("nan")
+                ),
+                "post_joint_pretrain_final_rsd_loss": (
+                    float(post_joint_pretrain_details.rsd_history[-1])
+                    if post_joint_pretrain_details.rsd_history
+                    else float("nan")
+                ),
+                "post_joint_pretrain_final_edge_loss": (
+                    float(post_joint_pretrain_details.edge_history[-1])
+                    if post_joint_pretrain_details.edge_history
+                    else float("nan")
+                ),
+                "post_joint_pretrain_render_ssim_vs_target": (
+                    float(1.0 - post_joint_pretrain_details.ssim_history[-1])
+                    if post_joint_pretrain_details.ssim_history
+                    else float("nan")
+                ),
+                "post_joint_pretrain_render_nrmse_vs_target": compute_nrmse(
+                    post_target_np,
+                    post_render_np,
+                ),
+                "post_joint_pretrain_render_hf_ratio": high_frequency_ratio(post_render_np),
+            }
+        )
 
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
-    torch.save(
-        {
-            "sharp_gt": sharp_gt.detach().cpu(),
-            "measurement_gt": meas_gt.detach().cpu(),
-            "pretrain_target": pretrain_target.detach().cpu(),
-            "pretrain_render": pretrain_render.detach().cpu(),
-            "pretrain_abs_error": pretrain_abs_error.detach().cpu(),
-            "sharp_recon": result.sharp_final.detach().cpu(),
-            "measurement_pred": result.measurement_pred.detach().cpu(),
-            "seidel_final": result.seidel_final.detach().cpu(),
-            "loss_history": result.loss_history,
-            "ssim_history": result.ssim_history,
-            "rsd_history": result.rsd_history,
-            "tv_history": result.tv_history,
-            "anchor_history": result.anchor_history,
-            "seidel_rms_floor_history": result.seidel_rms_floor_history,
-            "seidel_wavefront_rms_history": result.seidel_wavefront_rms_history,
-            "pretrain_history": result.pretrain_history,
-            "pretrain_ssim_history": pretrain_details.ssim_history,
-            "pretrain_rsd_history": pretrain_details.rsd_history,
-            "pretrain_edge_history": pretrain_details.edge_history,
-        },
-        out_dir / "tensors.pt",
-    )
+    tensor_payload: dict[str, Any] = {
+        "sharp_gt": sharp_gt.detach().cpu(),
+        "measurement_gt": meas_gt.detach().cpu(),
+        "pretrain_target": pretrain_target.detach().cpu(),
+        "pretrain_render": pretrain_render.detach().cpu(),
+        "pretrain_abs_error": pretrain_abs_error.detach().cpu(),
+        "sharp_recon": result.sharp_final.detach().cpu(),
+        "measurement_pred": result.measurement_pred.detach().cpu(),
+        "seidel_final": result.seidel_final.detach().cpu(),
+        "first_joint_sharp_recon": first_result.sharp_final.detach().cpu(),
+        "first_joint_recon_percentile": first_joint_recon_percentile.detach().cpu(),
+        "first_joint_measurement_pred": first_result.measurement_pred.detach().cpu(),
+        "first_joint_seidel_final": first_result.seidel_final.detach().cpu(),
+        "loss_history": result.loss_history,
+        "ssim_history": result.ssim_history,
+        "rsd_history": result.rsd_history,
+        "tv_history": result.tv_history,
+        "anchor_history": result.anchor_history,
+        "seidel_rms_floor_history": result.seidel_rms_floor_history,
+        "seidel_wavefront_rms_history": result.seidel_wavefront_rms_history,
+        "first_joint_loss_history": first_result.loss_history,
+        "first_joint_ssim_history": first_result.ssim_history,
+        "first_joint_rsd_history": first_result.rsd_history,
+        "first_joint_tv_history": first_result.tv_history,
+        "first_joint_anchor_history": first_result.anchor_history,
+        "first_joint_seidel_rms_floor_history": first_result.seidel_rms_floor_history,
+        "first_joint_seidel_wavefront_rms_history": first_result.seidel_wavefront_rms_history,
+        "pretrain_history": result.pretrain_history,
+        "pretrain_ssim_history": pretrain_details.ssim_history,
+        "pretrain_rsd_history": pretrain_details.rsd_history,
+        "pretrain_edge_history": pretrain_details.edge_history,
+    }
+    if post_joint_pretrain_details is not None:
+        assert post_joint_pretrain_render is not None
+        assert post_joint_pretrain_target is not None
+        assert post_joint_pretrain_abs_error is not None
+        tensor_payload.update(
+            {
+                "post_joint_pretrain_source": post_joint_pretrain_source_tensor.detach().cpu(),
+                "post_joint_pretrain_initial_render": post_joint_pretrain_initial_render.detach().cpu(),
+                "post_joint_pretrain_target": post_joint_pretrain_target.detach().cpu(),
+                "post_joint_pretrain_render": post_joint_pretrain_render.detach().cpu(),
+                "post_joint_pretrain_abs_error": post_joint_pretrain_abs_error.detach().cpu(),
+                "post_joint_pretrain_history": post_joint_pretrain_details.loss_history,
+                "post_joint_pretrain_ssim_history": post_joint_pretrain_details.ssim_history,
+                "post_joint_pretrain_rsd_history": post_joint_pretrain_details.rsd_history,
+                "post_joint_pretrain_edge_history": post_joint_pretrain_details.edge_history,
+            }
+        )
+    torch.save(tensor_payload, out_dir / "tensors.pt")
     save_mode_figures(out_dir, sharp_gt, meas_gt, result, metrics, title=mode)
 
     print(
@@ -1390,6 +1655,63 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--modes", nargs="+", choices=["joint", "frozen"], default=["joint"])
     ap.add_argument("--run-name", default=None)
     ap.add_argument("--num-iter", type=int, default=1000)
+    ap.add_argument(
+        "--second-joint-iter",
+        type=int,
+        default=0,
+        help=(
+            "Optional second joint phase. For joint mode only, this keeps the object "
+            "MLP weights, resets Seidel coefficients to zero, rebuilds optimizers, "
+            "and runs this many extra joint iterations."
+        ),
+    )
+    ap.add_argument(
+        "--post-joint-pretrain-iter",
+        type=int,
+        default=0,
+        help=(
+            "Optional object-only pretrain-style phase after the first joint and "
+            "before the second joint. Uses the pretrain target transform/loss knobs."
+        ),
+    )
+    ap.add_argument(
+        "--post-joint-pretrain-scalar",
+        type=float,
+        default=None,
+        help="Measurement scalar for --post-joint-pretrain-iter. Defaults to --pretrain-scalar.",
+    )
+    ap.add_argument(
+        "--post-joint-pretrain-source",
+        choices=["measurement_gt", "first_joint_object_raw_clipped", "first_joint_object_raw"],
+        default="measurement_gt",
+        help="Source image used to build the post-joint pretrain target.",
+    )
+    ap.add_argument(
+        "--post-joint-object-init",
+        choices=["inherit", "reset_fresh_same_seed"],
+        default="inherit",
+        help=(
+            "Object MLP state used before post-joint pretrain / second joint. "
+            "reset_fresh_same_seed rebuilds the MLP with the same case seed after "
+            "the first-joint target source has been computed."
+        ),
+    )
+    ap.add_argument(
+        "--post-joint-pretrain-target-transform",
+        choices=["none", "linear_contrast", "percentile_gamma"],
+        default=None,
+        help="Target transform for post-joint pretrain. Defaults to --pretrain-target-transform.",
+    )
+    ap.add_argument("--post-joint-pretrain-contrast-alpha", type=float, default=None)
+    ap.add_argument("--post-joint-pretrain-percentile-lo", type=float, default=None)
+    ap.add_argument("--post-joint-pretrain-percentile-hi", type=float, default=None)
+    ap.add_argument("--post-joint-pretrain-gamma", type=float, default=None)
+    ap.add_argument(
+        "--post-joint-pretrain-rsd-weight",
+        type=float,
+        default=None,
+        help="RSD loss weight for post-joint pretrain. Defaults to --pretrain-rsd-weight.",
+    )
     ap.add_argument("--pretrain-iter", type=int, default=400)
     ap.add_argument("--lr-obj", type=float, default=5e-3)
     ap.add_argument("--lr-seidel", type=float, default=1e-2)
@@ -1503,6 +1825,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     args.scheduler = None if args.scheduler == "none" else args.scheduler
+    if args.second_joint_iter < 0:
+        raise ValueError("--second-joint-iter must be non-negative")
+    if args.post_joint_pretrain_iter < 0:
+        raise ValueError("--post-joint-pretrain-iter must be non-negative")
+    if args.post_joint_pretrain_iter > 0 and args.second_joint_iter <= 0:
+        raise ValueError("--post-joint-pretrain-iter requires --second-joint-iter > 0")
+    if args.post_joint_pretrain_rsd_weight is not None and args.post_joint_pretrain_rsd_weight < 0:
+        raise ValueError("--post-joint-pretrain-rsd-weight must be non-negative")
     if args.seidel_rms_floor_weight < 0.0:
         raise ValueError("--seidel-rms-floor-weight must be non-negative")
     if args.seidel_rms_floor_alpha < 0.0:

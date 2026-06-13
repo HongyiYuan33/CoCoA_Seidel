@@ -396,6 +396,17 @@ def run_args_for_case(
         modes=["joint"],
         run_name=None,
         num_iter=num_iter,
+        second_joint_iter=sweep_args.second_joint_iter,
+        post_joint_pretrain_iter=sweep_args.post_joint_pretrain_iter,
+        post_joint_pretrain_scalar=sweep_args.post_joint_pretrain_scalar,
+        post_joint_pretrain_source=sweep_args.post_joint_pretrain_source,
+        post_joint_object_init=sweep_args.post_joint_object_init,
+        post_joint_pretrain_target_transform=sweep_args.post_joint_pretrain_target_transform,
+        post_joint_pretrain_contrast_alpha=sweep_args.post_joint_pretrain_contrast_alpha,
+        post_joint_pretrain_percentile_lo=sweep_args.post_joint_pretrain_percentile_lo,
+        post_joint_pretrain_percentile_hi=sweep_args.post_joint_pretrain_percentile_hi,
+        post_joint_pretrain_gamma=sweep_args.post_joint_pretrain_gamma,
+        post_joint_pretrain_rsd_weight=sweep_args.post_joint_pretrain_rsd_weight,
         pretrain_iter=pretrain_iter,
         lr_obj=sweep_args.lr_obj,
         lr_seidel=sweep_args.lr_seidel,
@@ -1161,6 +1172,64 @@ def run_stage1_case_subprocess(
         str(args.stage1_pretrain_iter),
         "--stage1-num-iter",
         str(args.stage1_num_iter),
+        "--second-joint-iter",
+        str(args.second_joint_iter),
+        "--post-joint-pretrain-iter",
+        str(args.post_joint_pretrain_iter),
+    ]
+    if args.post_joint_pretrain_scalar is not None:
+        cmd.extend(
+            [
+                "--post-joint-pretrain-scalar",
+                str(args.post_joint_pretrain_scalar),
+            ]
+        )
+    cmd.extend(["--post-joint-pretrain-source", args.post_joint_pretrain_source])
+    cmd.extend(["--post-joint-object-init", args.post_joint_object_init])
+    if args.post_joint_pretrain_target_transform is not None:
+        cmd.extend(
+            [
+                "--post-joint-pretrain-target-transform",
+                args.post_joint_pretrain_target_transform,
+            ]
+        )
+    if args.post_joint_pretrain_contrast_alpha is not None:
+        cmd.extend(
+            [
+                "--post-joint-pretrain-contrast-alpha",
+                str(args.post_joint_pretrain_contrast_alpha),
+            ]
+        )
+    if args.post_joint_pretrain_percentile_lo is not None:
+        cmd.extend(
+            [
+                "--post-joint-pretrain-percentile-lo",
+                str(args.post_joint_pretrain_percentile_lo),
+            ]
+        )
+    if args.post_joint_pretrain_percentile_hi is not None:
+        cmd.extend(
+            [
+                "--post-joint-pretrain-percentile-hi",
+                str(args.post_joint_pretrain_percentile_hi),
+            ]
+        )
+    if args.post_joint_pretrain_gamma is not None:
+        cmd.extend(
+            [
+                "--post-joint-pretrain-gamma",
+                str(args.post_joint_pretrain_gamma),
+            ]
+        )
+    if args.post_joint_pretrain_rsd_weight is not None:
+        cmd.extend(
+            [
+                "--post-joint-pretrain-rsd-weight",
+                str(args.post_joint_pretrain_rsd_weight),
+            ]
+        )
+    cmd.extend(
+        [
         "--lr-obj",
         str(args.lr_obj),
         "--lr-seidel",
@@ -1223,7 +1292,8 @@ def run_stage1_case_subprocess(
         str(args.seidel_rms_floor_pupil_samples),
         "--skip-report",
         "--skip-config-write",
-    ]
+        ]
+    )
     if args.candidate_mode == "gt_locked_front4":
         cmd.extend(
             [
@@ -1427,6 +1497,53 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stage1-size", type=int, default=STAGE1["size"])
     parser.add_argument("--stage1-pretrain-iter", type=int, default=STAGE1["pretrain_iter"])
     parser.add_argument("--stage1-num-iter", type=int, default=STAGE1["num_iter"])
+    parser.add_argument(
+        "--second-joint-iter",
+        type=int,
+        default=0,
+        help=(
+            "Optional second joint phase for stage1 joint cases. Keeps object "
+            "weights, resets Seidel coefficients to zero, and reruns joint training."
+        ),
+    )
+    parser.add_argument(
+        "--post-joint-pretrain-iter",
+        type=int,
+        default=0,
+        help=(
+            "Optional object-only pretrain-style phase after first joint and before "
+            "second joint. Uses the same pretrain target transform/loss settings."
+        ),
+    )
+    parser.add_argument(
+        "--post-joint-pretrain-scalar",
+        type=float,
+        default=None,
+        help="Measurement scalar for --post-joint-pretrain-iter. Defaults to --pretrain-scalar.",
+    )
+    parser.add_argument(
+        "--post-joint-pretrain-source",
+        choices=["measurement_gt", "first_joint_object_raw_clipped", "first_joint_object_raw"],
+        default="measurement_gt",
+        help="Source image used to build the post-joint pretrain target.",
+    )
+    parser.add_argument(
+        "--post-joint-object-init",
+        choices=["inherit", "reset_fresh_same_seed"],
+        default="inherit",
+        help="Object MLP initialization before post-joint pretrain / second joint.",
+    )
+    parser.add_argument(
+        "--post-joint-pretrain-target-transform",
+        choices=["none", "linear_contrast", "percentile_gamma"],
+        default=None,
+        help="Target transform for post-joint pretrain. Defaults to --pretrain-target-transform.",
+    )
+    parser.add_argument("--post-joint-pretrain-contrast-alpha", type=float, default=None)
+    parser.add_argument("--post-joint-pretrain-percentile-lo", type=float, default=None)
+    parser.add_argument("--post-joint-pretrain-percentile-hi", type=float, default=None)
+    parser.add_argument("--post-joint-pretrain-gamma", type=float, default=None)
+    parser.add_argument("--post-joint-pretrain-rsd-weight", type=float, default=None)
     parser.add_argument("--stage2-size", type=int, default=STAGE2["size"])
     parser.add_argument("--stage2-pretrain-iter", type=int, default=STAGE2["pretrain_iter"])
     parser.add_argument("--stage2-num-iter", type=int, default=STAGE2["num_iter"])
@@ -1504,6 +1621,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--candidate-mode gt_locked_front4 requires --seidel-convention classical5d or classical6d")
     if args.gt_locked_atol < 0.0:
         raise ValueError("--gt-locked-atol must be non-negative")
+    if args.second_joint_iter < 0:
+        raise ValueError("--second-joint-iter must be non-negative")
+    if args.post_joint_pretrain_iter < 0:
+        raise ValueError("--post-joint-pretrain-iter must be non-negative")
+    if args.post_joint_pretrain_iter > 0 and args.second_joint_iter <= 0:
+        raise ValueError("--post-joint-pretrain-iter requires --second-joint-iter > 0")
+    if args.post_joint_pretrain_rsd_weight is not None and args.post_joint_pretrain_rsd_weight < 0:
+        raise ValueError("--post-joint-pretrain-rsd-weight must be non-negative")
     if args.seidel_rms_floor_weight < 0.0:
         raise ValueError("--seidel-rms-floor-weight must be non-negative")
     if args.seidel_rms_floor_alpha < 0.0:
